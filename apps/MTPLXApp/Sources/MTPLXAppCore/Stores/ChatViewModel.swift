@@ -79,6 +79,16 @@ public struct PendingToolTrace: Identifiable, Equatable, Sendable {
     }
 }
 
+// MARK: - ChatLiveDecodeObservable
+
+/// Dedicated observable for the visible conversation's live TPS reading so
+/// numeric tok/s updates never trigger `ChatViewModel.objectWillChange` on
+/// the transcript, sidebar, or streaming answer bubble.
+@MainActor
+public final class ChatLiveDecodeObservable: ObservableObject {
+    @Published public internal(set) var reading: HeadlineDecodeReading = .absent
+}
+
 // MARK: - ChatViewModel
 //
 // One per app session. Owns the chat surface's published state plus the
@@ -129,6 +139,9 @@ public final class ChatViewModel: ObservableObject {
     /// Frontend streaming-performance instrumentation (inert unless
     /// MTPLX_UI_PERF / MTPLX_AIME_DIAGNOSTICS is set at launch).
     public let uiPerfProbe = UIStreamPerfProbe()
+    /// Isolated live TPS observable for header chips without waking the
+    /// full chat view hierarchy during numeric tok/s ticks.
+    public let liveDecode = ChatLiveDecodeObservable()
     public var hasStreamingReasoning: Bool { currentTurnStream?.hasReasoning ?? false }
     public var hasStreamingContent: Bool { currentTurnStream?.hasContent ?? false }
     public var handoffAssistantMessageID: UUID? { currentTurnStream?.handoffAssistantMessageID }
@@ -216,17 +229,25 @@ public final class ChatViewModel: ObservableObject {
     /// what the header chip shows after a turn finishes, surviving a
     /// switch away and back.
     private var heldDecodeReadings: [UUID: HeadlineDecodeReading] = [:]
+    public var performanceLock: Bool = false {
+        didSet {
+            guard performanceLock != oldValue else { return }
+            updateStreamDisplayLinkFrameRate()
+        }
+    }
     private var streamFlushTask: Task<Void, Never>?
     private var streamDisplayLink: CADisplayLink?
     private let streamDisplayLinkTarget = StreamFlushLinkTarget()
     // Fallback cadence for the headless path only (no attached display,
-    // e.g. unit tests). The live reveal is display-link driven; see
-    // ensureStreamFlushLoop. At local-model rates (~30-70 tok/s), 32 ms
-    // still reveals characters—not words.
-    private static let streamFlushInterval: Duration = .milliseconds(32)
+    // e.g. unit tests). The live reveal is display-link driven at native
+    // screen refresh rate (up to 120 Hz on ProMotion); see ensureStreamFlushLoop.
+    private static let streamFlushInterval: Duration = .milliseconds(16)
+    private static let performanceLockStreamFlushInterval: Duration = .milliseconds(33)
     /// Hard bound on how far a coalescing buffer may run ahead of its
-    /// document if the flush task ever stalls (freeze backstop).
-    private static let streamBufferFlushBackstop = 1_024
+    /// document if the display link ever stalls (freeze backstop). Sized
+    /// at 4 KB so high-TPS (300+ tok/s) copy-lane bursts stay strictly
+    /// vsync-paced instead of firing off-phase mid-SSE flushes.
+    static let streamBufferFlushBackstop = 4_096
     private static let liveDecodeUpdateInterval: TimeInterval = 0.20
     private static let requestContextCharacterBudget = 64_000
     private static let requestRecentVerbatimMessageCount = 8
@@ -312,6 +333,7 @@ public final class ChatViewModel: ObservableObject {
         // through the mirror properties. Only the visible error banner
         // is per-surface state worth resetting here.
         lastError = nil
+        syncLiveDecodeObservable()
     }
 
     public func delete(_ conversation: ChatConversation) async {
@@ -331,6 +353,8 @@ public final class ChatViewModel: ObservableObject {
         refreshConversations()
         if current == nil, let next = conversations.first {
             select(next)
+        } else {
+            syncLiveDecodeObservable()
         }
     }
 
@@ -672,6 +696,7 @@ public final class ChatViewModel: ObservableObject {
         )
         objectWillChange.send()
         turnStreams[conversation.id] = stream
+        syncLiveDecodeObservable()
         uiPerfProbe.turnStarted()
         lastError = nil
         ensureStreamFlushLoop()
@@ -924,6 +949,7 @@ public final class ChatViewModel: ObservableObject {
 
                 stream.contentDocument.reset()
                 stream.contentBuffer = ""
+                stream.typewriterPacer.noteDrainedAll()
                 stream.hasContent = false
                 stream.phase = .thinking
                 // Start the next round from a fully flushed document so
@@ -1129,16 +1155,30 @@ public final class ChatViewModel: ObservableObject {
             || now.timeIntervalSince(stream.lastLiveDecodeUpdateAt) >= Self.liveDecodeUpdateInterval
         else { return }
         let next = HeadlineDecodeReading.live(value)
-        // Publish only when the chip's displayed reading changes. The
-        // header latches on its own 0.5 s poll and renders whole tok/s,
-        // so a publish on every 200 ms frame re-evaluated the whole
-        // transcript, sidebar and composer five times a second for a
-        // number nobody could see change.
-        if !Self.sameDisplayedReading(stream.decodeReading, next) {
+        let previous = stream.decodeReading
+        // Publish on ChatViewModel ONLY on lifecycle phase transitions
+        // (.absent -> .live) so ChatHeaderView flips the chip on immediately
+        // without re-evaluating the entire transcript, sidebar, and streaming
+        // answer bubble on every live tok/s tick. Live numeric ticks flow
+        // through `liveDecode` and ChatHeaderView's own 0.5 s poll.
+        if case .live = previous {
+            // Same lifecycle phase — keep ChatViewModel silent.
+        } else {
             publishTurnState(stream)
         }
         stream.lastLiveDecodeUpdateAt = now
         stream.decodeReading = next
+        if stream.conversationID == current?.id,
+           !Self.sameDisplayedReading(liveDecode.reading, next) {
+            liveDecode.reading = next
+        }
+    }
+
+    private func syncLiveDecodeObservable() {
+        let next = chatDecodeReading
+        if liveDecode.reading != next {
+            liveDecode.reading = next
+        }
     }
 
     /// Two readings the header chip would render identically: the same
@@ -1204,6 +1244,9 @@ public final class ChatViewModel: ObservableObject {
             stream.decodeReading = .held(value: value, completedAt: Date())
         } else if case .live(let value) = stream.decodeReading {
             stream.decodeReading = .held(value: value, completedAt: Date())
+        }
+        if stream.conversationID == current?.id {
+            syncLiveDecodeObservable()
         }
     }
 
@@ -1305,21 +1348,44 @@ public final class ChatViewModel: ObservableObject {
 
     // MARK: - Stream UI coalescing
 
+    /// Native refresh-rate range for the streaming reveal display link.
+    /// Uses the screen's full ProMotion ceiling (120 Hz on ProMotion Macs,
+    /// Native display-link rate range: `30 Hz` when Performance mode is on
+    /// (`performanceLock`) to reduce WindowServer Metal compositing overhead
+    /// alongside MLX decode; otherwise native ProMotion (`60–120 Hz` on
+    /// supported displays, `60 Hz` on standard panels) so high-TPS streams
+    /// paint every vsync.
+    static func preferredDisplayLinkFrameRateRange(
+        maximumFramesPerSecond: Int,
+        performanceLock: Bool = false
+    ) -> CAFrameRateRange {
+        if performanceLock {
+            return CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
+        }
+        let maxFPS = Float(max(60, maximumFramesPerSecond))
+        return CAFrameRateRange(minimum: 60, maximum: maxFPS, preferred: maxFPS)
+    }
+
+    private func updateStreamDisplayLinkFrameRate() {
+        guard let link = streamDisplayLink else { return }
+        let maxFPS = (NSScreen.main ?? NSScreen.screens.first)?.maximumFramesPerSecond ?? 60
+        link.preferredFrameRateRange = Self.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: maxFPS,
+            performanceLock: performanceLock
+        )
+    }
+
     /// One shared reveal loop drives EVERY in-flight turn stream (the
     /// pacing state itself is per-stream). Started with the first live
     /// turn, stopped when the last one settles.
     private func ensureStreamFlushLoop() {
         guard streamDisplayLink == nil, streamFlushTask == nil else { return }
-        // Reveal on the DISPLAY clock, not a dispatch timer. The 32 ms
-        // Task.sleep loop this replaces was measured slipping 4-9 frame
-        // multiples under decode load (flush-gap p95 140 ms / max 315 ms
-        // while the paint watchdog's display link fired 60 Hz without one
-        // missed tick — 2026-08-19 cache-hit field session): main-queue
-        // timer continuations get coalesced under sustained SoC pressure
-        // and starve outright during scroll-tracking runloop modes, and
-        // every slipped tick reads as freeze-then-multi-line-vomit. A
-        // display link in .common modes wakes exactly once per painted
-        // frame, so reveal cadence and paint cadence cannot drift apart.
+        // Reveal on the DISPLAY clock at the screen's native refresh rate
+        // (120 Hz on ProMotion Macs, 60 Hz on standard displays, or 30 Hz
+        // when Performance mode is active). A display link in .common modes
+        // wakes once per target frame so reveal cadence and paint cadence
+        // stay locked without coalescing under SoC load or starving during
+        // scroll-tracking runloop modes.
         if let screen = NSScreen.main ?? NSScreen.screens.first {
             streamDisplayLinkTarget.onTick = { [weak self] in
                 self?.flushLiveTurnStreams()
@@ -1328,11 +1394,9 @@ public final class ChatViewModel: ObservableObject {
                 target: streamDisplayLinkTarget,
                 selector: #selector(StreamFlushLinkTarget.tick(_:))
             )
-            // 60 Hz is already finer than the old 32 ms cadence and halves
-            // wakeups on ProMotion panels; the reveal budget uses real dt,
-            // so the system dropping to 30 Hz just scales the per-tick cut.
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 30, maximum: 60, preferred: 60
+            link.preferredFrameRateRange = Self.preferredDisplayLinkFrameRateRange(
+                maximumFramesPerSecond: screen.maximumFramesPerSecond,
+                performanceLock: performanceLock
             )
             link.add(to: .main, forMode: .common)
             streamDisplayLink = link
@@ -1341,8 +1405,11 @@ public final class ChatViewModel: ObservableObject {
         // Headless fallback (no attached display; unit tests).
         streamFlushTask = Task { [weak self] in
             while !Task.isCancelled {
+                let interval = (self?.performanceLock == true)
+                    ? Self.performanceLockStreamFlushInterval
+                    : Self.streamFlushInterval
                 do {
-                    try await Task.sleep(for: Self.streamFlushInterval)
+                    try await Task.sleep(for: interval)
                 } catch {
                     return
                 }
@@ -1393,13 +1460,11 @@ public final class ChatViewModel: ObservableObject {
         }
     }()
     private static let typewriterMinRevealCharacters = 3
-    /// Per-tick reveal ceiling. The old behavior whole-drained any
-    /// buffer above 4 KB in a single frame — that WAS the visible
-    /// "vomit" paste whenever the main thread hiccuped and a backlog
-    /// built (2026-08-17 field regression). The 256-character ceiling
-    /// still clears a 4 KB recovery backlog in well under a second;
-    /// steady-state streams reveal only a few characters per tick.
-    private static let typewriterMaxRevealCharacters = 256
+    /// Per-tick reveal ceiling. Bounds single-frame catch-up after a stall
+    /// so a multi-KB backlog still types across frames instead of pasting
+    /// whole, while giving 120 Hz / 60 Hz high-TPS (350+ tok/s) bursts ample
+    /// headroom without ceiling saturation.
+    static let typewriterMaxRevealCharacters = 512
 
     // Rate-based reveal (streamwar 2026-08-19, re-estimated 2026-09-02):
     // the budget tracks the ARRIVAL rate, not the backlog size, so
@@ -1435,7 +1500,7 @@ public final class ChatViewModel: ObservableObject {
         let paced = Self.typewriterPacingEnabled && !drainCompletely
         var drainedBytes = 0
         let probeEnabled = uiPerfProbe.enabled
-        let applyStarted = probeEnabled
+        let applyStarted = (probeEnabled || paced)
             ? ProcessInfo.processInfo.systemUptime
             : 0
         if !stream.reasoningBuffer.isEmpty {
@@ -1449,29 +1514,39 @@ public final class ChatViewModel: ObservableObject {
             drainedBytes += delta.utf8.count
             stream.reasoningDocument.append(delta)
         }
+        var oldestArrivalBeforeCut: Double?
         if !stream.contentBuffer.isEmpty {
+            oldestArrivalBeforeCut = stream.oldestBufferedArrivalUptime
             let delta: String
             if paced {
                 let cut = Self.pacedCut(
                     stream.contentBuffer,
                     budget: typewriterTickBudget(
                         of: stream,
-                        now: ProcessInfo.processInfo.systemUptime
+                        now: applyStarted
                     )
                 )
                 delta = cut.reveal
                 stream.contentBuffer = cut.rest
+                if stream.contentBuffer.isEmpty {
+                    stream.typewriterPacer.noteDrainedAll()
+                } else {
+                    stream.typewriterPacer.noteRevealed(chars: delta.count)
+                }
             } else {
                 delta = stream.contentBuffer
                 stream.contentBuffer = ""
+                stream.typewriterPacer.noteDrainedAll()
             }
             drainedBytes += delta.utf8.count
             stream.contentDocument.append(delta)
         } else if paced {
-            stream.typewriterPacer.noteIdleTick(now: ProcessInfo.processInfo.systemUptime)
+            stream.typewriterPacer.noteIdleTick(now: applyStarted)
         }
         if probeEnabled, drainedBytes > 0 {
-            let applyMs = (ProcessInfo.processInfo.systemUptime - applyStarted) * 1000
+            let finishedAt = ProcessInfo.processInfo.systemUptime
+            let applyMs = (finishedAt - applyStarted) * 1000
+            let lagMs = oldestArrivalBeforeCut.map { max(0, (finishedAt - $0) * 1000) } ?? 0
             uiPerfProbe.flushApplied(
                 drainedBytes: drainedBytes,
                 applyMs: applyMs,
@@ -1480,7 +1555,9 @@ public final class ChatViewModel: ObservableObject {
                 linesFinalizedTotal: stream.contentDocument.liveFinalizedCount
                     + stream.reasoningDocument.liveFinalizedCount,
                 mergesTotal: stream.contentDocument.liveSegmentMergeCount
-                    + stream.reasoningDocument.liveSegmentMergeCount
+                    + stream.reasoningDocument.liveSegmentMergeCount,
+                backlogChars: stream.contentBuffer.count,
+                lagMs: lagMs
             )
         }
     }
@@ -1616,6 +1693,7 @@ public final class ChatViewModel: ObservableObject {
         if case .held = stream.decodeReading {
             heldDecodeReadings[stream.conversationID] = stream.decodeReading
         }
+        syncLiveDecodeObservable()
         stopStreamFlushLoopIfIdle()
         uiPerfProbe.turnEnded(requestId: stream.requestId)
         stream.task = nil

@@ -21,7 +21,9 @@ struct VerifyWaterfallExpander: View {
 
     var body: some View {
         let latest = backend.hasObservedCurrentRunMetrics ? backend.latest : nil
-        let isRunning = backend.daemonState.kind == .running
+        let summary = VerifyWaterfallSummary(latest: latest)
+        let daemonKind = backend.daemonState.kind
+        let isRunning = daemonKind == .running
         let liftAnimation: Animation? = themeStore.reduceMotionPreference
             ? nil
             : Motion.surfaceLiftSpring
@@ -42,8 +44,8 @@ struct VerifyWaterfallExpander: View {
                         .tracking(3)
                         .foregroundStyle(Brand.textHighlight)
                     Spacer()
-                    if let calls = latest?.verifyCalls, let total = latest?.verifyTimeS, total > 0, calls > 0 {
-                        Text(tr("%@ / call", Format.milliseconds(total / Double(calls))))
+                    if let perCall = summary.msPerCallSeconds {
+                        Text(tr("%@ / call", Format.milliseconds(perCall)))
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(Brand.textHighlight.opacity(0.65))
                     }
@@ -54,7 +56,7 @@ struct VerifyWaterfallExpander: View {
             .padding(.bottom, expanded ? 12 : 0)
 
             if expanded {
-                content(latest: latest)
+                content(summary: summary, daemonKind: daemonKind)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
@@ -70,51 +72,55 @@ struct VerifyWaterfallExpander: View {
     }
 
     @ViewBuilder
-    private func content(latest: MetricsLatest?) -> some View {
-        let segments = verifySegments(latest: latest)
-        let total = latest?.verifyTimeS ?? 0
-        if total > 0 && !segments.isEmpty {
+    private func content(summary: VerifyWaterfallSummary, daemonKind: DaemonStateKind) -> some View {
+        let segments = verifySegments(summary: summary)
+        if summary.totalSeconds > 0 && !segments.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                StackedBar(segments: segments, total: total)
-                HStack {
-                    Label(tr("Total verify_time_s: %@", Format.duration(total)),
-                          systemImage: "stopwatch")
-                        .font(.caption)
-                        .foregroundStyle(Brand.textHighlight.opacity(0.65))
-                    Spacer()
+                StackedBar(segments: segments, total: summary.totalSeconds)
+                if let footer = summary.footerSummary {
+                    HStack {
+                        Label(footer, systemImage: "stopwatch")
+                            .font(.caption)
+                            .foregroundStyle(Brand.textHighlight.opacity(0.65))
+                        Spacer()
+                    }
                 }
             }
         } else {
-            Text(tr("Detailed timing will show here once a model is running."))
+            Text(VerifyWaterfallSummary.emptyStateMessage(daemonState: daemonKind))
                 .font(.callout)
                 .foregroundStyle(Brand.textHighlight.opacity(0.6))
         }
     }
 
-    /// Verify-waterfall tonal palette. Distinguishes 12 different
-    /// pipeline phases by warmth and opacity rather than by hue —
-    /// previously this strip rendered as a literal blue/indigo/purple/
-    /// pink rainbow ("AI app debug palette") despite the rest of the
-    /// dashboard being polished chrome. Each phase now maps to a tone
-    /// on the chrome scale: chromeAccent → accentChrome → typeBody →
-    /// typeSecondary → typeTertiary etc., with semantic colors
-    /// reserved for the binary outcomes (accept = success, repair /
-    /// rollback = danger) and warnings.
-    private func verifySegments(latest: MetricsLatest?) -> [StackedBarSegment] {
-        let candidates: [(label: String, value: Double?, tint: Color)] = [
-            ("verify_forward", latest?.verifyForwardTimeS, Brand.coolChrome),
-            ("target_dist", latest?.verifyTargetDistTimeS ?? latest?.verifyLogitsEvalTimeS, Brand.typeTertiary),
-            ("verify_hidden", latest?.verifyHiddenEvalTimeS, Brand.typeSecondary),
-            ("verify_other", latest?.verifyEvalUnattributedS, Brand.warning),
-        ]
-        return candidates.compactMap { entry in
-            guard let v = entry.value, v > 0 else { return nil }
-            return StackedBarSegment(
-                label: entry.label,
-                value: v,
-                tint: entry.tint,
-                valueLabel: Format.milliseconds(v)
+    /// Verify-waterfall tonal palette. Maps draft / verify_forward /
+    /// target_dist / verify_hidden / verify_overhead onto the chrome scale
+    /// with semantic warmth reserved for draft vs unattributed overhead.
+    private func verifySegments(summary: VerifyWaterfallSummary) -> [StackedBarSegment] {
+        summary.segments.map { segment in
+            StackedBarSegment(
+                label: segment.label,
+                value: segment.seconds,
+                tint: segmentTint(for: segment.key),
+                valueLabel: Format.milliseconds(segment.seconds)
             )
+        }
+    }
+
+    private func segmentTint(for key: String) -> Color {
+        switch key {
+        case "draft":
+            return Brand.accentWarm
+        case "verify_forward", "verify":
+            return Brand.coolChrome
+        case "target_dist":
+            return Brand.typeTertiary
+        case "verify_hidden":
+            return Brand.typeSecondary
+        case "verify_overhead", "verify_other":
+            return Brand.warning
+        default:
+            return Brand.accentChrome
         }
     }
 }

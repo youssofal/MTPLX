@@ -289,6 +289,7 @@
  "request_top_p": null,
  "requested_mtp_depth": 3,
  "requested_speculative_depth": 3,
+ "resolved_reasoning_effort": "medium",
  "rollback_time_s": "<float>",
  "runtime_mtp_enabled": true,
  "sampled_draft_chain_cuts": 0,

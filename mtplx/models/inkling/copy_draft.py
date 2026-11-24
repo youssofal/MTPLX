@@ -84,6 +84,17 @@ class PromptCopy:
         self.accepted = self.accepted_blocks = 0
         self.ema, self.seen, self.suspend_until, self.backoff = 0.5, 0, 0, 64
         self.suspensions = 0
+        self.width_cap = self.probation_cap
+        self._probation_span = (
+            max(
+                1,
+                self.align_verify_proposals(
+                    min(self.probation_cap, self.max_proposals), self.max_proposals
+                ),
+            )
+            if self.max_proposals > 0
+            else 1
+        )
         self.lookup_build_s = self.copy_round_s = self.ordinary_round_s = 0.0
         self.declines, self.limits, self.verify_rows = Counter(), Counter(), Counter()
         # The cost gate (mtplx/copy_gate.py, MTPLX_CONTEXT_COPY_GATE, off by default): it prices
@@ -126,7 +137,7 @@ class PromptCopy:
         if ext < self.min_ext:
             return self.decline("insufficient_match_extension")
         cap = (
-            self.block_cap if self.seen >= 2 and self.ema >= 0.5 else self.probation_cap
+            self.width_cap if self.seen >= 2 and self.ema >= 0.5 else self.probation_cap
         )
         length = context_copy.block_for_ext(ext, cap)
         if self.gate is not None:
@@ -160,7 +171,22 @@ class PromptCopy:
             if legal < len(guesses):
                 guesses = guesses[:legal]
                 self.limits["grammar_prefix"] += 1
+        aligned = self.align_verify_proposals(len(guesses), self.max_proposals)
+        if aligned < len(guesses):
+            guesses = guesses[:aligned]
         return guesses
+
+    @staticmethod
+    def align_verify_proposals(length: int, max_proposals: int, tile: int = 8) -> int:
+        if length <= 0:
+            return 0
+        if tile <= 1 or max_proposals < tile:
+            return length
+        verify_rows = length + 1
+        if verify_rows <= tile:
+            return length
+        snapped_rows = (verify_rows // tile) * tile
+        return max(0, snapped_rows - 1)
 
     def observe(self, offered, landed, emitted_tokens, wall_s):
         # Host wall covers selection, proposal, target verification and commit submission.
@@ -178,15 +204,31 @@ class PromptCopy:
         self.accepted += landed
         self.accepted_blocks += int(landed > 0)
         # Public 2.12.3 acceptance probation and exponential retry. Timing is telemetry.
-        share = landed / offered
-        self.ema = 0.7 * self.ema + 0.3 * share
+        # Measure match viability against a probation-sized prefix so wide-block edit
+        # boundaries that still land >= 4 verbatim tokens do not trigger blind lockouts,
+        # while adapting the block cap across 8-row verify tiles to match span length.
+        raw_share = landed / offered
+        match_ref = min(offered, self._probation_span)
+        match_score = min(1.0, landed / match_ref)
+        self.ema = 0.7 * self.ema + 0.3 * match_score
         self.seen += 1
-        if share >= 0.5:
+        if match_score >= 0.5:
             self.backoff = 64
-        if self.seen >= 3 and self.ema < 0.35:
+        if landed <= 1:
+            self.width_cap = self.probation_cap
+        elif landed == offered and offered >= self._probation_span:
+            if self.seen >= 2 and self.ema >= 0.5:
+                self.width_cap = self.block_cap
+        elif offered > self._probation_span:
+            if raw_share >= 0.75 and self.seen >= 2 and self.ema >= 0.5:
+                self.width_cap = self.block_cap
+            elif raw_share < 0.5:
+                self.width_cap = max(self.probation_cap, self.width_cap - 8)
+        if self.seen >= 3 and self.ema < 0.35 and landed < 4:
             self.suspend_until = emitted_tokens + self.backoff
             self.backoff = min(self.backoff * 2, 4096)
             self.ema, self.seen = 0.5, 0
+            self.width_cap = self.probation_cap
             self.suspensions += 1
 
     def _gate_costs(self):

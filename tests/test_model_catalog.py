@@ -268,6 +268,9 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
     ]
     assert recommended_catalog_ids(
         memory_gib=None, chip_tier=LEGACY_TIER

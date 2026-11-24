@@ -21,6 +21,7 @@ from mtplx.kernels.first_use import GpuRace, Incomplete, Mismatch, ProofCache
 _results, _calls, _lock = {}, Counter(), RLock()
 _request_projections = ContextVar("inkling_request_projections", default=None)
 _log = logging.getLogger(__name__)
+MAX_PANEL_ROWS = 32
 
 
 @lru_cache(maxsize=8)
@@ -373,7 +374,7 @@ def _logits(h, weight, vocab, metal, pack, cap):
         not metal
         or not batch
         or not width
-        or not 1 <= rows <= 8
+        or not 1 <= rows <= MAX_PANEL_ROWS
         or weight.ndim != 2
         or not 0 < vocab <= weight.shape[0]
         or width != weight.shape[1]

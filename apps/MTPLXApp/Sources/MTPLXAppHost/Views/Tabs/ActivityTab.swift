@@ -60,9 +60,16 @@ struct ActivityTab: View {
                         recentRequestsCard(recent: recent)
                         cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
                         bankCard(sessionBank: sessionBank)
-                        sessionsListCard(sessions: sessions)
+                        sessionsListCard(sessions: sessions, sessionBank: sessionBank)
                     }
-                    .padding(20)
+                    .padding(.top, 20)
+                    .padding(.horizontal, 20)
+                    .padding(
+                        .bottom,
+                        DashboardLayout.scrollBottomPadding(
+                            daemonRunning: backend.daemonState.kind == .running
+                        )
+                    )
                 }
             }
         }
@@ -468,38 +475,12 @@ struct ActivityTab: View {
     }
 
     private func agentLaneText(_ latest: MetricsLatest?) -> String {
-        guard let latest else { return tr("No agent lane data yet.") }
-        var parts: [String] = []
-        if let client = latest.requestClientHint, !client.isEmpty {
-            parts.append(client)
-        }
-        if let mode = latest.requestGenerationMode, !mode.isEmpty {
-            parts.append(mode.uppercased())
-        }
-        if let depth = latest.requestEffectiveMtpDepth
-            ?? latest.requestDepth
-            ?? latest.mtpDepth
-            ?? latest.speculativeDepth {
-            parts.append(tr("depth %lld", depth))
-        }
-        if let reasoning = latest.requestReasoningMode, !reasoning.isEmpty {
-            parts.append(tr("reasoning %@", reasoning))
-        } else if let thinking = latest.requestEnableThinking {
-            parts.append(thinking ? tr("thinking on") : tr("thinking off"))
-        }
-        if let filteredCount = latest.requestFilteredToolCount {
-            parts.append(tr("%@ active tools", Format.integer(filteredCount)))
-        } else if let filtered = latest.requestFilteredToolNames {
-            parts.append(tr("%@ active tools", Format.integer(filtered.count)))
-        } else if let tools = latest.requestToolNames {
-            parts.append(tr("%lld tools", tools.count))
-        } else if let toolCount = latest.requestToolCount {
-            parts.append(tr("%@ tools", Format.integer(toolCount)))
-        }
-        if let hidden = latest.requestHiddenToolNames, !hidden.isEmpty {
-            parts.append(tr("%lld hidden", hidden.count))
-        }
-        return parts.isEmpty ? tr("No agent lane data yet.") : parts.joined(separator: " · ")
+        AgentLaneReadout.text(
+            latest: latest,
+            snapshotResolvedEffort: backend.snapshot?.resolvedReasoningEffort
+                ?? backend.snapshot?.profile.string("resolved_reasoning_effort"),
+            snapshotSettingsEffort: backend.snapshot?.settings.reasoningEffort
+        )
     }
 
     private func decodeSpeedText(_ latest: MetricsLatest?) -> String {
@@ -681,7 +662,7 @@ struct ActivityTab: View {
                 Divider().frame(height: 36)
                 StatTile(
                     label: tr("Bank size"),
-                    value: Format.bytes(sessionBank?.totalNbytes),
+                    value: Format.bytes(sessionBank?.effectiveTotalNbytes),
                     systemImage: "tray.full",
                     tint: .secondary
                 )
@@ -1105,6 +1086,14 @@ struct ActivityTab: View {
             reasoning += " override"
         }
         parts.append(reasoning)
+        if let effort = AgentLaneReadout.resolvedEffort(
+            latest: latest,
+            snapshotResolvedEffort: backend.snapshot?.resolvedReasoningEffort
+                ?? backend.snapshot?.profile.string("resolved_reasoning_effort"),
+            snapshotSettingsEffort: backend.snapshot?.settings.reasoningEffort
+        ) {
+            parts.append(tr("effort %@", effort))
+        }
         if latest.requestReasoningParser == "none" {
             parts.append(tr("parser off"))
         }
@@ -1250,7 +1239,7 @@ struct ActivityTab: View {
                 Label(tr("%@ tok", Format.integer(prefix.prefixLen)), systemImage: "text.alignleft")
                     .labelStyle(.titleAndIcon)
                     .font(.caption2)
-                Label(Format.bytes(prefix.nbytes), systemImage: "internaldrive")
+                Label(Format.bytes(prefix.effectiveNbytes), systemImage: "internaldrive")
                     .labelStyle(.titleAndIcon)
                     .font(.caption2)
             }
@@ -1261,7 +1250,7 @@ struct ActivityTab: View {
                 } else {
                     PillBadge(text: tr("cached"), systemImage: "checkmark", tint: .secondary)
                 }
-                Text(tr("%lld hits", prefix.hits))
+                Text(tr("%lld hits", prefix.effectiveHits))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -1282,12 +1271,12 @@ struct ActivityTab: View {
     }
 
     @ViewBuilder
-    private func sessionsListCard(sessions: SessionsPayload?) -> some View {
+    private func sessionsListCard(sessions: SessionsPayload?, sessionBank: SessionBank?) -> some View {
         Card(tr("Engine Sessions")) {
             if let sessions, !sessions.sessions.isEmpty {
                 VStack(spacing: 4) {
                     ForEach(sessions.sessions) { session in
-                        sessionRow(session)
+                        sessionRow(session, sessionBank: sessionBank)
                         Divider().opacity(0.3)
                     }
                 }
@@ -1301,8 +1290,10 @@ struct ActivityTab: View {
     }
 
     @ViewBuilder
-    private func sessionRow(_ session: SessionRow) -> some View {
+    private func sessionRow(_ session: SessionRow, sessionBank: SessionBank?) -> some View {
         let canClearSession = backend.capabilities?.features["session_clear"] != false
+        let resolvedBytes = SessionBytesReadout.bytes(for: session, sessionBank: sessionBank)
+        let resolvedHits = SessionBytesReadout.hits(for: session, sessionBank: sessionBank)
         HStack {
             Image(systemName: "circle.fill")
                 .font(.caption2)
@@ -1316,11 +1307,17 @@ struct ActivityTab: View {
                 .labelStyle(.titleAndIcon)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Label(Format.bytes(session.bytes),
+            Label(Format.bytes(resolvedBytes),
                   systemImage: "internaldrive")
                 .labelStyle(.titleAndIcon)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if resolvedHits > 0 {
+                Text(tr("%lld hits", resolvedHits))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
             Text(Format.relative(from: session.ageSeconds))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)

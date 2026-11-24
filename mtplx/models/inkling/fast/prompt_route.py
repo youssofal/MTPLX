@@ -89,6 +89,29 @@ def asynchronous():
     return os.environ.get(SYNC_ENV, "").strip().lower() not in ("1", "on", "yes", "true", "sync")
 
 
+def visit_handover_policy(rows, *, architecture=None, is_tensor=None):
+    """Return ``(every_visits, sync)`` for ``Model.forward`` handover evaluation.
+
+    On M5+ (``tensor`` units) this preserves asynchronous handover every
+    ``HAND_OVER_VISITS`` visits. On M1/M2 (``g13*``/``g14*``) it flushes
+    synchronously every 1–2 visits so multiple MoE/attention visits do not pile
+    into one multi-second Metal command buffer (#422).
+    """
+    if int(rows) <= 32:
+        return (0, False)
+    from . import prompt_flash
+
+    tensor = prompt_flash.tensor_units() if is_tensor is None else bool(is_tensor)
+    if tensor:
+        return (HAND_OVER_VISITS, False) if asynchronous() else (0, False)
+    gen = prompt_flash.gpu_generation(architecture)
+    if 0 < gen <= 14:
+        return (1 if int(rows) >= 1024 else 2, True)
+    if not asynchronous():
+        return (0, False)
+    return (2 if int(rows) >= 1024 else HAND_OVER_VISITS, False)
+
+
 def hand_over(parts, part):
     """Evaluate ``part``, a prompt call's next query tile (``parts``: its earlier tiles, kept alive by the caller).
     Synchronous: wait for it, as the attention did. Otherwise start it and wait only for the tile

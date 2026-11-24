@@ -78,7 +78,7 @@ final class ReadoutsTests: XCTestCase {
         ]))
         XCTAssertEqual(summary.turns, 2)
         XCTAssertEqual(summary.throttledTurns, 1)
-        XCTAssertEqual(summary.caption, "1 of 2 reads throttled")
+        XCTAssertEqual(summary.caption, "1/2 throttled")
     }
 
     func testTheSessionFigureComesFromTheServersOwnTotals() throws {
@@ -198,5 +198,24 @@ final class ReadoutsTests: XCTestCase {
         L10n.activate(.english)
         let thinking = try XCTUnwrap(TurnThinking(thinkingRow(tokens: nil, seconds: 12.4, firstAnswer: 12.9)))
         XCTAssertEqual(thinking.summary, "thought for 12 s · first answer at 13 s")
+    }
+
+    func testAThinkingTurnWhoseFirstVisibleOutputIsAToolCallSaysToolCall() throws {
+        L10n.activate(.english)
+        var values = thinkingRow(tokens: 14_200, seconds: 372.0, firstAnswer: 373.0).values
+        values["first_visible_kind"] = .string("tool_call")
+        let toolThinking = try XCTUnwrap(TurnThinking(row(values)))
+        XCTAssertEqual(toolThinking.firstVisibleKind, "tool_call")
+        XCTAssertEqual(
+            toolThinking.summary,
+            "thought for \(Format.duration(372.0)), \(Format.integer(14_200)) tokens · first tool call at \(Format.duration(373.0))"
+        )
+
+        values["first_visible_kind"] = .string("text")
+        let textThinking = try XCTUnwrap(TurnThinking(row(values)))
+        XCTAssertEqual(
+            textThinking.summary,
+            "thought for \(Format.duration(372.0)), \(Format.integer(14_200)) tokens · first answer at \(Format.duration(373.0))"
+        )
     }
 }

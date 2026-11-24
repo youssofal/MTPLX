@@ -1,5 +1,6 @@
 from mtplx import thermal
 import subprocess
+import threading as _threading
 import time as _time
 
 import pytest
@@ -237,7 +238,7 @@ def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
     calls: list[str] = []
     _patch_smart_fan_hardware(monkeypatch, calls)
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("first")
     # begin_request is non-blocking; synchronize with the worker before
     # asserting on the hardware call log.
@@ -278,8 +279,9 @@ def test_smart_fan_controller_begin_does_not_block_on_hardware(monkeypatch):
     )
     monkeypatch.setattr(thermal, "set_thermal_profile", slow_set)
     monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "soc_temperature_c", lambda: {"ok": False, "celsius": None, "sensor": None})
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     import time as _time
 
     started = _time.monotonic()
@@ -304,7 +306,7 @@ def test_smart_fan_controller_retries_failed_ramp_once(monkeypatch):
         ],
     )
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("req")
 
     assert controller.wait_for_ramp(5.0) is True
@@ -326,7 +328,7 @@ def test_smart_fan_controller_reports_failure_without_hammering(monkeypatch):
         ],
     )
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("req")
 
     assert controller.wait_for_ramp(5.0) is False
@@ -343,7 +345,7 @@ def test_smart_fan_controller_detach_never_touches_hardware(monkeypatch):
     calls: list[str] = []
     _patch_smart_fan_hardware(monkeypatch, calls)
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("req")
     assert controller.wait_for_ramp(5.0) is True
 
@@ -382,6 +384,7 @@ def test_smart_fan_restore_retries_with_backoff_until_verified(monkeypatch):
     ))
     monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
     monkeypatch.setattr(thermal, "_clear_max_marker", lambda: None)
+    monkeypatch.setattr(thermal, "soc_temperature_c", lambda: {"ok": False, "celsius": None, "sensor": None})
 
     restore_results = [
         {"ok": False, "message": "socket ack without effect"},
@@ -402,7 +405,7 @@ def test_smart_fan_restore_retries_with_backoff_until_verified(monkeypatch):
         thermal.SmartFanController, "_RESTORE_RETRY_BACKOFF_S", (0.05, 0.05, 0.05, 0.05)
     )
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("req")
     assert controller.wait_for_ramp(5.0) is True
     controller.end_request("req", wait_for_restore=True)
@@ -427,7 +430,7 @@ def test_smart_fan_stale_lease_reconciler_drops_leaked_leases(monkeypatch):
     monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.2")
 
     controller = thermal.SmartFanController(
-        restore_delay_s=0, activity_probe=lambda: False
+        restore_delay_s=0, sensorless_delay_s=0, activity_probe=lambda: False
     )
     controller.begin_request("leaked-lease")
     assert controller.wait_for_ramp(5.0) is True
@@ -451,7 +454,7 @@ def test_smart_fan_stale_lease_reconciler_never_fires_while_engine_busy(monkeypa
     monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.1")
 
     controller = thermal.SmartFanController(
-        restore_delay_s=0, activity_probe=lambda: True
+        restore_delay_s=0, sensorless_delay_s=0, activity_probe=lambda: True
     )
     controller.begin_request("long-generation")
     assert controller.wait_for_ramp(5.0) is True
@@ -1578,7 +1581,7 @@ def test_smart_fan_soak_probe_failure_falls_back_to_legacy_restore(monkeypatch):
     _patch_smart_fan_hardware(monkeypatch, calls)
     _patch_soak_probe(monkeypatch, [None])
 
-    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0)
     controller.begin_request("burst")
     assert controller.wait_for_ramp(5.0) is True
 
@@ -1605,6 +1608,7 @@ def test_smart_fan_soak_disabled_by_env_restores_immediately(monkeypatch):
     controller = thermal.SmartFanController(restore_delay_s=0)
     controller.begin_request("burst")
     assert controller.wait_for_ramp(5.0) is True
+    probes.clear()
 
     controller.end_request("burst", wait_for_restore=True)
 
@@ -1675,3 +1679,355 @@ def test_soc_temperature_without_temperature_data_is_not_ok(monkeypatch):
     _patch_status_temperatures(monkeypatch, {})
 
     assert thermal.soc_temperature_c()["ok"] is False
+
+
+def test_is_desktop_mac_detects_studio_and_respects_override(monkeypatch):
+    monkeypatch.delenv("MTPLX_DESKTOP_MAC", raising=False)
+    for model_id in ("Mac13,1", "Mac14,14", "Mac15,14", "Mac16,9", "MacStudio1,1", "Macmini9,1"):
+        monkeypatch.setattr(thermal, "_sysctl_hw_model", lambda m=model_id: m)
+        assert thermal.is_desktop_mac() is True
+    for model_id in ("Mac17,7", "Mac16,1", "Mac16,12", "MacBookPro18,2"):
+        monkeypatch.setattr(thermal, "_sysctl_hw_model", lambda m=model_id: m)
+        assert thermal.is_desktop_mac() is False
+    # Unlisted future Mac IDs fall back to battery presence detection.
+    monkeypatch.setattr(thermal, "_sysctl_hw_model", lambda: "Mac18,9")
+    monkeypatch.setattr(thermal, "_has_internal_battery", lambda: False)
+    assert thermal.is_desktop_mac() is True
+    monkeypatch.setattr(thermal, "_has_internal_battery", lambda: True)
+    assert thermal.is_desktop_mac() is False
+    monkeypatch.setattr(thermal, "_has_internal_battery", lambda: None)
+    assert thermal.is_desktop_mac() is False
+    monkeypatch.setenv("MTPLX_DESKTOP_MAC", "1")
+    assert thermal.is_desktop_mac() is True
+    monkeypatch.setenv("MTPLX_DESKTOP_MAC", "0")
+    assert thermal.is_desktop_mac() is False
+
+
+def test_set_fan_rpm_prefers_daemon_socket_and_falls_back_to_cli(monkeypatch):
+    monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
+    sent: list[str] = []
+    current_target = [2600]
+
+    def fake_sock(cmd, *, timeout_s=3.0):
+        sent.append(cmd)
+        return {"ok": True, "response": "ok", "command": ["<socket>", cmd]}
+
+    monkeypatch.setattr(thermal, "_daemon_socket_send", fake_sock)
+    monkeypatch.setattr(
+        thermal,
+        "fan_summary",
+        lambda: {"ok": True, "fans": [{"mode": "manual", "target_rpm": current_target[0], "max_capacity_rpm": 5000}]},
+    )
+
+    res = thermal.set_fan_rpm(2600)
+    assert res["ok"] is True
+    assert res["rpm"] == 2600
+    assert sent == ["set 2600"]
+
+    # Socket absent -> CLI `set <rpm>` fallback must verify actual target_rpm
+    monkeypatch.setattr(thermal, "_daemon_socket_send", lambda *a, **k: None)
+    cli_cmds: list[list[str]] = []
+
+    def fake_probe(cmd, *, timeout_s=3.0):
+        cli_cmds.append(cmd)
+        current_target[0] = int(cmd[-1])
+        return {"ok": True, "command": cmd, "returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_probe)
+    res2 = thermal.set_fan_rpm(2200)
+    assert res2["ok"] is True
+    assert cli_cmds[0][-2:] == ["set", "2200"]
+
+    # CLI exit 0 without verified target RPM must fail closed.
+    monkeypatch.setattr(
+        thermal,
+        "_run_probe",
+        lambda cmd, *, timeout_s=3.0: {"ok": True, "command": cmd, "returncode": 0, "stdout": "", "stderr": ""},
+    )
+    monkeypatch.setattr(
+        thermal,
+        "fan_summary",
+        lambda: {"ok": True, "fans": [{"mode": "auto", "target_rpm": 1200, "max_capacity_rpm": 5000}]},
+    )
+    res3 = thermal.set_fan_rpm(3000)
+    assert res3["ok"] is False
+
+
+def test_smart_fan_cool_turn_stays_on_auto_with_zero_hardware_calls(monkeypatch):
+    calls: list[object] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    monkeypatch.setattr(thermal, "set_fan_rpm", lambda rpm: calls.append(("rpm", rpm)) or {"ok": True, "rpm": rpm})
+    monkeypatch.setattr(thermal, "soc_temperature_c", lambda: {"ok": True, "celsius": 60.0, "sensor": "TCMb"})
+
+    controller = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    controller.begin_request("cool")
+    assert controller.wait_for_step(5.0) == 0
+    assert controller.status()["current_level"] == 0
+    assert calls == []
+
+    status = controller.end_request("cool", wait_for_restore=True)
+    assert status["current_level"] == 0
+    assert calls == []
+    controller._shutdown = True
+
+
+def test_smart_fan_stepped_ramp_and_hysteresis_laptop_and_desktop(monkeypatch):
+    calls: list[object] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    fan_mode = ["auto"]
+
+    def track_profile(profile):
+        calls.append(profile)
+        fan_mode[0] = "max" if profile in ("performance", "max") else "auto"
+        return {"ok": True, "profile": profile}
+
+    monkeypatch.setattr(thermal, "set_thermal_profile", track_profile)
+    monkeypatch.setattr(
+        thermal,
+        "install_max_lifecycle_hooks",
+        lambda: (lambda: track_profile("auto")),
+    )
+    monkeypatch.setattr(
+        thermal,
+        "fan_summary",
+        lambda: {
+            "ok": True,
+            "fans": [
+                {"mode": fan_mode[0], "target_rpm": 5000 if fan_mode[0] == "max" else 1200, "actual_rpm": 1200, "max_capacity_rpm": 5000, "raw": {"min_rpm": 1000}},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        thermal,
+        "set_fan_rpm",
+        lambda rpm: calls.append(("rpm", rpm)) or {"ok": True, "rpm": rpm},
+    )
+    current_temp = [65.0]
+    monkeypatch.setattr(
+        thermal,
+        "soc_temperature_c",
+        lambda: {"ok": True, "celsius": current_temp[0], "sensor": "TCMb"},
+    )
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVE_TEMP_POLL_S", 0.02)
+
+    controller = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    assert controller.status()["profile_kind"] == "laptop"
+    controller.begin_request("r1")
+    assert controller.wait_for_step(5.0) == 0
+
+    # Warm to 72C -> level 1 (55% of 1000..5000 = 3200 RPM)
+    current_temp[0] = 72.0
+    assert _wait_until(lambda: controller.status()["current_level"] == 1)
+    assert calls[-1] == ("rpm", 3200)
+
+    # Drop slightly to 69C: hysteresis (70 - 5 = 65) keeps level 1
+    current_temp[0] = 69.0
+    _time.sleep(0.08)
+    assert controller.status()["current_level"] == 1
+
+    # Climb to 84C -> level 2 (80% of 1000..5000 = 4200 RPM)
+    current_temp[0] = 84.0
+    assert _wait_until(lambda: controller.status()["current_level"] == 2)
+    assert calls[-1] == ("rpm", 4200)
+
+    # Peak at 92C -> level 3 (max/performance)
+    current_temp[0] = 92.0
+    assert _wait_until(lambda: controller.status()["current_level"] == 3 and controller.status()["commanded_max"] is True)
+
+    # Cool down to 64C while still active -> steps down cleanly and eventually returns to auto
+    current_temp[0] = 64.0
+    assert _wait_until(lambda: controller.status()["current_level"] == 0)
+    assert "silent" in calls
+
+    controller.end_request("r1", wait_for_restore=True)
+    controller._shutdown = True
+
+    # Desktop profile (Mac Studio): higher thresholds and gentler RPM fractions
+    desktop_ctrl = thermal.SmartFanController(restore_delay_s=0, desktop=True)
+    assert desktop_ctrl.status()["profile_kind"] == "desktop"
+    assert desktop_ctrl._desired_level_for_temp(72.0, 0) == 0
+    assert desktop_ctrl._desired_level_for_temp(77.0, 0) == 1
+    assert desktop_ctrl._target_rpm_for_level(1) == 2800  # 1000 + 0.45 * 4000
+    assert desktop_ctrl._desired_level_for_temp(87.0, 1) == 2
+    assert desktop_ctrl._desired_level_for_temp(93.0, 2) == 3
+    desktop_ctrl._shutdown = True
+
+
+def test_smart_fan_sensorless_delay_avoids_ramp_on_short_turn(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    controller = thermal.SmartFanController(restore_delay_s=0, sensorless_delay_s=0.25)
+    controller.begin_request("short")
+    assert controller.wait_for_step(5.0) == 0
+    assert calls == []
+    controller.end_request("short", wait_for_restore=True)
+    assert calls == []
+
+    # Longer sensorless turn ramps once delay elapses
+    controller.begin_request("long")
+    assert controller.wait_for_ramp(5.0) is True
+    assert calls == ["performance"]
+    controller.end_request("long", wait_for_restore=True)
+    assert calls == ["performance", "auto"]
+    controller._shutdown = True
+
+
+def test_smart_fan_step_active_detach_race_never_touches_hardware_or_restores(monkeypatch):
+    calls: list[object] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+
+    # Case 1: detach fires while soc_temperature_c() is in flight
+    c1 = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    monkeypatch.setattr(c1, "_ensure_lifecycle_hooks", lambda: calls.append("hooks"))
+    monkeypatch.setattr(c1, "_ensure_worker_locked", lambda: None)
+    c1.begin_request("r1")
+    monkeypatch.setattr(
+        thermal,
+        "soc_temperature_c",
+        lambda: (c1.detach(), {"ok": True, "celsius": 76.0, "sensor": "TCMb"})[1],
+    )
+    monkeypatch.setattr(thermal, "set_fan_rpm", lambda rpm: calls.append(("rpm", rpm)) or {"ok": True, "rpm": rpm})
+    c1._do_step_active()
+    assert calls == []
+    status1 = c1.status()
+    assert status1["current_level"] == 0
+    assert status1["commanded_max"] is False
+    c1._shutdown = True
+
+    # Case 2: detach fires while set_fan_rpm() is in flight
+    calls.clear()
+    c2 = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    monkeypatch.setattr(c2, "_ensure_lifecycle_hooks", lambda: calls.append("hooks"))
+    monkeypatch.setattr(c2, "_ensure_worker_locked", lambda: None)
+    c2.begin_request("r2")
+    monkeypatch.setattr(thermal, "soc_temperature_c", lambda: {"ok": True, "celsius": 76.0, "sensor": "TCMb"})
+    monkeypatch.setattr(
+        thermal,
+        "set_fan_rpm",
+        lambda rpm: (c2.detach(), calls.append(("rpm", rpm)), {"ok": True, "rpm": rpm})[2],
+    )
+    c2._do_step_active()
+    assert len(calls) == 1 and calls[0][0] == "rpm"
+    assert "hooks" not in calls
+    assert "auto" not in calls
+    status2 = c2.status()
+    assert status2["current_level"] == 0
+    assert status2["commanded_max"] is False
+    with c2._lock:
+        assert c2._cleanup is None
+    c2._shutdown = True
+
+
+def test_smart_fan_unsupported_and_failed_step_avoid_hook_leak_and_retry_storm(monkeypatch):
+    calls: list[object] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    hook_calls: list[str] = []
+    monkeypatch.setattr(thermal, "install_max_lifecycle_hooks", lambda: hook_calls.append("installed") or (lambda: {"ok": True}))
+    monkeypatch.setattr(thermal, "soc_temperature_c", lambda: {"ok": True, "celsius": 76.0, "sensor": "TCMb"})
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVE_TEMP_POLL_S", 0.02)
+
+    # Unsupported intermediate controller (e.g. TG Pro): falls back once to _do_ramp()
+    rpm_attempts: list[int] = []
+    monkeypatch.setattr(
+        thermal,
+        "set_fan_rpm",
+        lambda rpm: (rpm_attempts.append(rpm), {"ok": False, "unsupported_controller": True, "rpm": rpm, "message": "unsupported"})[1],
+    )
+    ctrl = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    ctrl.begin_request("u1")
+    assert ctrl.wait_for_ramp(5.0) is True
+    assert rpm_attempts == [rpm_attempts[0]]
+    assert calls == ["performance"]
+    assert hook_calls == ["installed"]
+    ctrl.end_request("u1", wait_for_restore=True)
+    ctrl._shutdown = True
+
+    # ThermalForge intermediate RPM failure: no hook leak, sets _ramp_failed_generation (no 2s spin)
+    hook_calls.clear()
+    calls.clear()
+    rpm_attempts.clear()
+    monkeypatch.setattr(
+        thermal,
+        "set_fan_rpm",
+        lambda rpm: (rpm_attempts.append(rpm), {"ok": False, "rpm": rpm, "message": "sudo denied"})[1],
+    )
+    ctrl2 = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    ctrl2.begin_request("f1")
+    assert ctrl2.wait_for_ramp(5.0) is False
+    _time.sleep(0.06)
+    assert len(rpm_attempts) == 2
+    assert hook_calls == []
+    ctrl2._shutdown = True
+
+
+def test_smart_fan_end_request_during_in_flight_set_fan_rpm_restores_auto(monkeypatch):
+    """If end_request(..., wait_for_restore=True) fires while set_fan_rpm() is already
+    in flight on hardware, wait_for_restore waits and _worker_loop restores Apple Auto
+    once set_fan_rpm finishes (distinct from detach(), which leaves fans untouched)."""
+    calls: list[object] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    fan_mode = ["auto"]
+
+    def track_profile(profile):
+        calls.append(profile)
+        fan_mode[0] = "max" if profile in ("performance", "max") else "auto"
+        return {"ok": True, "profile": profile}
+
+    monkeypatch.setattr(thermal, "set_thermal_profile", track_profile)
+    monkeypatch.setattr(
+        thermal,
+        "install_max_lifecycle_hooks",
+        lambda: (lambda: track_profile("auto")),
+    )
+    monkeypatch.setattr(
+        thermal,
+        "fan_summary",
+        lambda: {
+            "ok": True,
+            "fans": [
+                {
+                    "mode": fan_mode[0],
+                    "target_rpm": 5000 if fan_mode[0] == "max" else 1200,
+                    "actual_rpm": 1200,
+                    "max_capacity_rpm": 5000,
+                    "raw": {"min_rpm": 1000},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        thermal,
+        "soc_temperature_c",
+        lambda: {"ok": True, "celsius": 76.0, "sensor": "TCMb"},
+    )
+    entered = _threading.Event()
+    release = _threading.Event()
+
+    def slow_set_fan_rpm(rpm):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        fan_mode[0] = "manual"
+        calls.append(("rpm", rpm))
+        return {"ok": True, "rpm": rpm}
+
+    monkeypatch.setattr(thermal, "set_fan_rpm", slow_set_fan_rpm)
+
+    ctrl = thermal.SmartFanController(restore_delay_s=0, desktop=False)
+    ctrl.begin_request("r1")
+    assert entered.wait(timeout=5.0)
+
+    end_result: list[dict[str, object]] = []
+    ender = _threading.Thread(
+        target=lambda: end_result.append(ctrl.end_request("r1", wait_for_restore=True))
+    )
+    ender.start()
+    assert _wait_until(lambda: ctrl.status()["active"] is False)
+    release.set()
+    ender.join(timeout=5.0)
+    assert not ender.is_alive()
+
+    assert fan_mode[0] == "auto"
+    assert calls == [("rpm", 3200), "auto"]
+    assert ctrl.status()["current_level"] == 0
+    assert end_result and end_result[0]["current_level"] == 0
+    ctrl._shutdown = True

@@ -351,7 +351,12 @@ def test_chat_generator_exit_is_reraised_and_tags_client_disconnected(monkeypatc
 
 
 def test_completions_generator_exit_is_reraised(monkeypatch):
+    """Closing the /v1/completions stream generator mid-generation (client SSE
+    disconnect -> GeneratorExit) must re-raise cleanly AND record both the
+    lifetime cancellation count and cancellation telemetry receipt."""
+
     state = _fake_state()
+    state.requests_cancelled = 0
     state.runtime.tokenizer.encode = lambda _text, **_kwargs: [1, 2, 3]
     release_worker = Event()
     monkeypatch.setattr(
@@ -384,6 +389,47 @@ def test_completions_generator_exit_is_reraised(monkeypatch):
         asyncio.run(drive())
     finally:
         release_worker.set()
+
+    assert state.dashboard.lifetime.cancelled_total == 1
+    assert state.requests_cancelled == 1
+    cancel_records = [
+        record
+        for record in state.last_metrics
+        if record.get("request_cancelled")
+    ]
+    assert cancel_records
+    assert cancel_records[-1]["cancellation_reason"] == "client_disconnected"
+    assert cancel_records[-1]["stream_cancelled_by_client"] is True
+
+
+def test_completions_stream_worker_error_does_not_record_cancellation(monkeypatch):
+    """A worker exception during /v1/completions streaming ends the stream with
+    an error frame without misclassifying teardown as a cancellation."""
+
+    state = _fake_state()
+    state.requests_cancelled = 0
+    state.runtime.tokenizer.encode = lambda _text, **_kwargs: [1, 2, 3]
+
+    def failing_generation(_state, _prompt_ids, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(openai, "_run_generation_dispatched", failing_generation)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/completions",
+            json={"prompt": "hello", "stream": True, "max_tokens": 8},
+        )
+        assert response.status_code == 200
+
+    frames = _frames(response.text)
+    assert any(
+        frame.get("choices") and frame["choices"][0].get("finish_reason") == "error"
+        for frame in frames
+    )
+    assert state.dashboard.lifetime.cancelled_total == 0
+    assert state.requests_cancelled == 0
+    assert not any(record.get("request_cancelled") for record in state.last_metrics)
 
 
 def test_a_wedged_commit_after_an_early_frame_refuses_the_next_turn(monkeypatch):

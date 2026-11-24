@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import MTPLXAppCore
 #if canImport(AppKit)
@@ -13,9 +14,115 @@ import AppKit
 // bindings and what they save are the same ones the page always had; the
 // catalog (`SettingsCatalog.swift`) says where each one lives.
 
+private struct SettingsBackendSnapshot: Equatable {
+    let configuration: MTPLXAppConfiguration
+    let configuredModelFamily: String
+    let daemonRunning: Bool
+    let effectiveFanMode: MTPLXFanMode
+    let lastLaunchScheduling: DaemonLaunchScheduling?
+    let daemonRestartStatus: DaemonRestartStatus
+    let daemonRestartEligibility: DaemonRestartEligibility
+    let snapshotIntervalBounds: AppCapabilities.SnapshotInterval?
+    let memoryPlan: MemoryPlanStatus?
+    let settings: MutableSettings?
+    let startupModelControls: ModelControls?
+
+    @MainActor
+    init(backend: MTPLXBackendStore, configuredModelFamily: String) {
+        configuration = backend.configuration
+        self.configuredModelFamily = configuredModelFamily
+        daemonRunning = backend.daemonState.kind == .running || backend.daemonState.kind == .warming
+        effectiveFanMode = backend.effectiveFanMode
+        lastLaunchScheduling = backend.lastLaunchScheduling
+        daemonRestartStatus = backend.daemonRestartStatus
+        daemonRestartEligibility = backend.daemonRestartEligibility
+        snapshotIntervalBounds = backend.capabilities?.snapshotInterval
+        memoryPlan = backend.memoryPlan
+        settings = backend.settings
+        startupModelControls = backend.health?.startup?.modelControls
+    }
+}
+
+/// Projects `MTPLXBackendStore` down to the low-frequency fields `SettingsTab`
+/// actually renders. High-frequency 500ms SSE metrics, thermal RPM polls, and
+/// health checks produce equal snapshots and never trigger a Settings re-render
+/// or scroll/layout jump.
+@MainActor
+private final class SettingsBackendProjection: ObservableObject {
+    @Published private(set) var snapshot: SettingsBackendSnapshot
+
+    private weak var backend: MTPLXBackendStore?
+    private var backendCancellable: AnyCancellable?
+    private var refreshPending = false
+    private var familyModel: String
+    private var configuredModelFamily: String
+
+    init(backend: MTPLXBackendStore) {
+        let model = backend.configuration.model
+        let family = MTPLXModelOption.modelFamily(for: model)
+        self.backend = backend
+        familyModel = model
+        configuredModelFamily = family
+        snapshot = SettingsBackendSnapshot(
+            backend: backend,
+            configuredModelFamily: family
+        )
+        backendCancellable = backend.objectWillChange.sink { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+    }
+
+    func refreshNow() {
+        refreshPending = false
+        guard let backend else { return }
+        let model = backend.configuration.model
+        if model != familyModel {
+            familyModel = model
+            configuredModelFamily = MTPLXModelOption.modelFamily(for: model)
+        }
+        let next = SettingsBackendSnapshot(
+            backend: backend,
+            configuredModelFamily: configuredModelFamily
+        )
+        if next != snapshot {
+            snapshot = next
+        }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            refreshNow()
+        }
+    }
+}
+
 struct SettingsTab: View {
     @EnvironmentObject private var backend: MTPLXBackendStore
-    @EnvironmentObject private var hermes: HermesAgentStore
+
+    var body: some View {
+        SettingsTabBridge(backend: backend).equatable()
+    }
+}
+
+private struct SettingsTabBridge: View, Equatable {
+    let backend: MTPLXBackendStore
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.backend === rhs.backend
+    }
+
+    var body: some View {
+        SettingsTabContent(backend: backend)
+    }
+}
+
+private struct SettingsTabContent: View {
+    private let backend: MTPLXBackendStore
+    @StateObject private var projection: SettingsBackendProjection
     @EnvironmentObject private var themeStore: ThemeStore
     @EnvironmentObject private var languageStore: LanguageStore
     @State private var languagePopoverPresented = false
@@ -34,8 +141,24 @@ struct SettingsTab: View {
     /// A section the content should scroll to (sidebar click while the
     /// search shows several sections).
     @State private var scrollTarget: SettingsSection?
+    /// Optimistic Fan Mode selection while a live `/thermal/fan_mode` update is
+    /// in flight, preventing a single-frame bounce back to the previous segment.
+    @State private var optimisticFanMode: MTPLXFanMode?
+    @State private var fanModePending = false
 
     @EnvironmentObject private var router: AppRouter
+
+    @MainActor
+    init(backend: MTPLXBackendStore) {
+        self.backend = backend
+        _projection = StateObject(
+            wrappedValue: SettingsBackendProjection(backend: backend)
+        )
+    }
+
+    private var persistedConfiguration: MTPLXAppConfiguration {
+        projection.snapshot.configuration
+    }
 
     private var draftConfig: MTPLXAppConfiguration {
         get { drafts.draft }
@@ -101,11 +224,17 @@ struct SettingsTab: View {
         .environment(\.settingsSearch, search)
         .onAppear {
             // Pending edits survive a tab switch; only an unedited draft
-            // follows the persisted configuration.
-            drafts.adoptIfUnedited(backend.configuration)
+            // follows the persisted configuration, while immediate/external
+            // controls (Fan Mode, Scheduling, live reasoning/sampler) stay
+            // aligned so a later Save never reverts them.
+            projection.refreshNow()
+            let current = backend.configuration
+            drafts.adoptIfUnedited(current)
+            drafts.syncNonDraftedFields(from: current)
         }
-        .onChange(of: backend.configuration) { _, newConfiguration in
+        .onChange(of: projection.snapshot.configuration) { _, newConfiguration in
             drafts.adoptIfUnedited(newConfiguration)
+            drafts.syncNonDraftedFields(from: newConfiguration)
         }
         .confirmationDialog(
             tr("Clear all SessionBank entries?"),
@@ -135,7 +264,8 @@ struct SettingsTab: View {
     // MARK: - Content
 
     private var contentPane: some View {
-        ScrollViewReader { proxy in
+        let showSaveBar = settingsDirty || lastSaveError != nil
+        return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 36) {
                     if search.isActive {
@@ -153,7 +283,10 @@ struct SettingsTab: View {
                 }
                 .padding(.horizontal, 28)
                 .padding(.top, 24)
-                .padding(.bottom, 32)
+                // Reserve constant bottom room so showing or hiding the
+                // floating save bar never changes the scroll viewport height
+                // or triggers a layout reflow across the Settings page.
+                .padding(.bottom, 104)
                 .frame(maxWidth: Self.contentMaxWidth, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
@@ -169,22 +302,27 @@ struct SettingsTab: View {
                 scrollTarget = nil
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if settingsDirty || lastSaveError != nil {
-                SettingsSaveBar(
-                    running: daemonRunning,
-                    applying: isApplying,
-                    error: lastSaveError,
-                    onSave: { saveAndMaybeRestart(restart: daemonRunning) },
-                    onRevert: {
-                        lastSaveError = nil
-                        revertDraft()
-                    }
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+        .overlay(alignment: .bottom) {
+            Group {
+                if showSaveBar {
+                    SettingsSaveBar(
+                        running: daemonRunning,
+                        applying: isApplying,
+                        error: lastSaveError,
+                        onSave: { saveAndMaybeRestart(restart: daemonRunning) },
+                        onRevert: {
+                            lastSaveError = nil
+                            revertDraft()
+                        }
+                    )
+                    .frame(maxWidth: Self.contentMaxWidth)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 14)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
+            .animation(.smooth(duration: 0.18), value: showSaveBar)
         }
-        .animation(.smooth(duration: 0.2), value: settingsDirty)
     }
 
     private var noMatches: some View {
@@ -228,9 +366,6 @@ struct SettingsTab: View {
             if schedulingRestartPending && daemonRunning {
                 PillBadge(text: tr("restart to apply"), systemImage: "arrow.clockwise.circle.fill", tint: .mtplxWarning, emphasized: true)
             }
-        case .cooling:
-            // The live fan control (applies now, while MTPLX runs).
-            FanModeToggle()
         default:
             EmptyView()
         }
@@ -240,8 +375,8 @@ struct SettingsTab: View {
     /// sidebar's dots. The save bar itself keys off `settingsDirty`, so a
     /// field missing here can never hide an unsaved edit.
     private var unsavedSections: Set<SettingsSection> {
-        let draft = normalizedDraftConfigurationForSave()
-        let saved = normalizedConfigurationForSave(backend.configuration)
+        let draft = normalizedDraftConfigurationForSave(against: persistedConfiguration)
+        let saved = normalizedConfigurationForSave(persistedConfiguration)
         guard draft != saved else { return [] }
         var sections: Set<SettingsSection> = []
         if draft.launchDaemonOnOpen != saved.launchDaemonOnOpen
@@ -286,9 +421,7 @@ struct SettingsTab: View {
             || draft.hermesWorkspacePath != saved.hermesWorkspacePath {
             sections.insert(.clients)
         }
-        if draft.fanMode != saved.fanMode
-            || draft.pinFansAtMaxOnStart != saved.pinFansAtMaxOnStart
-            || draft.enableThermalPolling != saved.enableThermalPolling {
+        if draft.enableThermalPolling != saved.enableThermalPolling {
             sections.insert(.cooling)
         }
         if draft.executablePath != saved.executablePath
@@ -550,7 +683,7 @@ struct SettingsTab: View {
             // The picker says what the next launch will use; this says
             // what the daemon in front of you actually launched with.
             // Issue #398 could not tell those two apart at all.
-            if daemonRunning, let launched = backend.lastLaunchScheduling {
+            if daemonRunning, let launched = projection.snapshot.lastLaunchScheduling {
                 SettingsInfoRow(item: .schedulingMode) {
                     Text(tr(
                         "Running now: %@ (%@ / %@).",
@@ -714,11 +847,7 @@ struct SettingsTab: View {
                 }
             }
 
-            if let bank = backend.snapshot?.sessionBank {
-                SettingsInfoRow(item: .ramPolicy) {
-                    ramUsageRow(bank: bank)
-                }
-            }
+            SettingsRAMCacheUsageRow(backend: backend)
         }
 
         SettingsGroup(group: .ssdCache) {
@@ -781,11 +910,7 @@ struct SettingsTab: View {
                     }
                     .fixedSize()
                 }
-                if let cold = backend.snapshot?.sessionBank.coldTier {
-                    SettingsInfoRow(item: .ssdPolicy) {
-                        usageRow(cold: cold)
-                    }
-                }
+                SettingsSSDCacheUsageRow(backend: backend)
             }
         }
 
@@ -869,121 +994,11 @@ struct SettingsTab: View {
             ClientOpeningRows()
         }
 
-        SettingsGroup(group: .agents) {
-            SettingsRow(item: .agentWorkspace, layout: .stacked) {
-                HStack(spacing: 8) {
-                    TextField(
-                        MTPLXAppConfiguration.defaultHermesWorkspacePath(),
-                        text: $drafts.draft.hermesWorkspacePath
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.callout, design: .monospaced))
-
-                    Button {
-                        chooseHermesWorkspace()
-                    } label: {
-                        Image(systemName: "folder")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help(tr("Choose agent workspace"))
-                    .accessibilityLabel(tr("Choose agent workspace"))
-                }
-            }
-            hermesRows
-        }
-        // Hermes is checked when its status is on screen, not on every
-        // visit to Settings: the check runs the Hermes command line.
-        .task {
-            await hermes.prepare(configuration: backend.configuration)
-        }
-    }
-
-    @ViewBuilder
-    private var hermesRows: some View {
-        SettingsRow(item: .hermes) {
-            HStack(spacing: 8) {
-                // The first check shows its spinner in the status line
-                // below; this one covers a refresh of a loaded status.
-                if case .checkingInstall = hermes.connectionState,
-                   hermes.installStatus != nil {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Button {
-                    Task { await hermes.prepare(configuration: backend.configuration) }
-                } label: {
-                    Label(tr("Refresh"), systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
-        SettingsInfoRow(item: .hermes) {
-            if let status = hermes.installStatus {
-                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 14, verticalSpacing: 6) {
-                    hermesStatusLine(tr("Tools"), status.enabledToolsets.joined(separator: ", "))
-                    if let version = status.versionSummary {
-                        hermesStatusLine(tr("Version"), version)
-                    }
-                    if let update = status.updateSummary {
-                        hermesStatusLine(tr("Update"), update, color: Brand.warning)
-                    }
-                    if let updateCommand = status.updateCommand, status.updateSummary != nil {
-                        hermesStatusLine(tr("Command"), updateCommand)
-                    }
-                    if let gateway = status.gatewaySummary {
-                        hermesStatusLine(tr("Gateway"), gateway, color: hermesGatewayColor(for: status.gatewayHealth))
-                    }
-                    if status.gatewayNeedsRepair {
-                        GridRow {
-                            Text(tr("Repair"))
-                                .foregroundStyle(Brand.typeTertiary)
-                            Button {
-                                Task { await hermes.repairGateway() }
-                            } label: {
-                                Label(
-                                    hermes.gatewayRepairInFlight ? tr("Repairing") : tr("Repair Gateway"),
-                                    systemImage: "arrow.triangle.2.circlepath"
-                                )
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(hermes.gatewayRepairInFlight)
-                        }
-                    }
-                    if let repairMessage = hermes.gatewayRepairMessage {
-                        hermesStatusLine(tr("Repair result"), repairMessage)
-                    }
-                    ForEach(status.integrationSummaries.prefix(3), id: \.self) { item in
-                        hermesStatusLine(tr("Messaging"), item)
-                    }
-                    ForEach(status.warnings.prefix(2), id: \.self) { warning in
-                        hermesStatusLine(tr("Warning"), warning, color: Brand.warning)
-                    }
-                    hermesStatusLine(tr("Capability"), status.capabilitySummary)
-                }
-            } else {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(tr("Checking Hermes"))
-                }
-            }
-        }
-    }
-
-    private func hermesStatusLine(
-        _ label: String,
-        _ value: String,
-        color: Color = Brand.typeSecondary
-    ) -> some View {
-        GridRow {
-            Text(label)
-                .foregroundStyle(Brand.typeTertiary)
-            statusText(value, color: color)
-        }
+        SettingsHermesGroup(
+            backend: backend,
+            hermesWorkspacePath: $drafts.draft.hermesWorkspacePath,
+            onChooseWorkspace: chooseHermesWorkspace
+        )
     }
 
     // MARK: - Cooling
@@ -992,34 +1007,32 @@ struct SettingsTab: View {
     private var coolingSection: some View {
         SettingsGroup(group: .fans) {
             SettingsRow(item: .fanMode) {
-                Picker(tr("Fan Mode"), selection: fanModeSelectionBinding) {
+                FanModeToggle(
+                    activeMode: activeFanMode,
+                    pending: fanModePending,
+                    onSelect: commitFanMode
+                )
+            }
+            SettingsInfoRow(item: .fanMode) {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
                     ForEach(MTPLXFanMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode.rawValue)
+                        let selected = mode == activeFanMode
+                        GridRow {
+                            Text(mode.title)
+                                .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                                .foregroundStyle(selected ? Brand.typeHi : Brand.typeTertiary)
+                            Text(mode.help)
+                                .foregroundStyle(selected ? Brand.typeBody : Brand.typeTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
             }
             SettingsToggleRow(item: .thermalPolling, isOn: $drafts.draft.enableThermalPolling)
-            if let thermal = backend.thermal, thermal.ok {
-                let fanRpms = thermal.fans.compactMap(\.actualRpm)
-                if let max = thermal.maxRpm, !fanRpms.isEmpty {
-                    let verified = fanRpms.allSatisfy { Double($0) >= Double(max) * 0.9 }
-                    SettingsInfoRow(item: .fanMode) {
-                        PillBadge(
-                            text: verified ? tr("fan ramp verified") : tr("fan ramp pending"),
-                            systemImage: verified ? "checkmark.seal.fill" : "clock",
-                            tint: verified ? Brand.success : Brand.warning,
-                            emphasized: !verified
-                        )
-                    }
-                }
-            } else if !backend.configuration.enableThermalPolling {
-                SettingsInfoRow(item: .thermalPolling) {
-                    Text(tr("Turn on Thermal Polling above to confirm fan state."))
-                }
-            }
+            SettingsCoolingFanStatusRow(
+                backend: backend,
+                thermalPollingEnabled: persistedConfiguration.enableThermalPolling
+            )
         }
     }
 
@@ -1073,7 +1086,7 @@ struct SettingsTab: View {
 
     @ViewBuilder
     private var streamCadenceRow: some View {
-        let bounds = backend.capabilities?.snapshotInterval
+        let bounds = projection.snapshot.snapshotIntervalBounds
         let minMs = bounds?.minMs ?? 100
         let maxMs = bounds?.maxMs ?? 5000
         let perfLockMs = bounds?.performanceLockMs ?? 1000
@@ -1185,6 +1198,7 @@ struct SettingsTab: View {
         drafts.lastSynced.applySchedulingPreset(preset)
         do {
             try backend.applySchedulingPresetSelection(preset)
+            projection.refreshNow()
             lastSaveError = nil
         } catch {
             lastSaveError = tr("Apply failed: %@", String(describing: error))
@@ -1212,7 +1226,7 @@ struct SettingsTab: View {
     /// the one now saved. This is what makes "restart to apply" honest for
     /// a control that no longer goes through the draft/dirty path.
     private var schedulingRestartPending: Bool {
-        guard let launched = backend.lastLaunchScheduling else { return false }
+        guard let launched = projection.snapshot.lastLaunchScheduling else { return false }
         return launched.selectedPreset != normalizedSchedulingPreset(draftConfig.schedulingPreset)
     }
 
@@ -1397,7 +1411,7 @@ struct SettingsTab: View {
     /// What the running engine actually planned, so the number in the field
     /// can be compared against a measured effect instead of a guess.
     private var memoryPlanCaption: String {
-        guard let plan = backend.memoryPlan, plan.available else {
+        guard let plan = projection.snapshot.memoryPlan, plan.available else {
             return tr("Start the model to see the plan the engine computes for this Mac.")
         }
         let ram = Format.bytes(plan.totalRamBytes)
@@ -1454,36 +1468,6 @@ struct SettingsTab: View {
         return trimmed
     }
 
-    @ViewBuilder
-    private func ramUsageRow(bank: SessionBank) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "memorychip")
-                .foregroundStyle(Brand.typeSecondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tr("Current RAM cache"))
-                    .font(.caption2)
-                    .foregroundStyle(Brand.typeTertiary)
-                HStack(spacing: 6) {
-                    Text(Format.bytes(bank.totalNbytes))
-                        .font(.system(.callout, design: .rounded).weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(Brand.typeBody)
-                    let entries = bank.entries ?? bank.prefixes?.count ?? 0
-                    Text(entries == 1 ? tr("· 1 entry") : tr("· %lld entries", entries))
-                        .font(.caption)
-                        .foregroundStyle(Brand.typeSecondary)
-                    if let maxBytes = bank.maxBytes {
-                        Text(tr("· cap %@", Format.bytes(maxBytes)))
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                }
-            }
-            Spacer()
-        }
-        .padding(.top, 6)
-    }
-
     private var ssdPolicyCaption: String {
         let target = draftLaunchTarget?.title ?? tr("this target")
         let targetDefault = defaultSSDSessionCache(for: LaunchTarget(rawValue: draftConfig.lastLaunchTarget))
@@ -1493,15 +1477,8 @@ struct SettingsTab: View {
         return tr("Target default is %@ for %@. Explicit choices override every launch target.", targetDefaultLabel, target)
     }
 
-    private var ssdCacheDirty: Bool {
-        draftConfig.ssdSessionCache != backend.configuration.ssdSessionCache
-            || draftConfig.ssdSessionCacheDir != backend.configuration.ssdSessionCacheDir
-            || draftConfig.ssdSessionCacheMaxSize != backend.configuration.ssdSessionCacheMaxSize
-            || draftConfig.ssdSessionCacheMinPrefixTokens != backend.configuration.ssdSessionCacheMinPrefixTokens
-    }
-
     private var daemonRunning: Bool {
-        backend.daemonState.kind == .running || backend.daemonState.kind == .warming
+        projection.snapshot.daemonRunning
     }
 
     private var effectiveSSDSessionCache: String {
@@ -1523,79 +1500,6 @@ struct SettingsTab: View {
         default:
             return "off"
         }
-    }
-
-    @ViewBuilder
-    private func usageRow(cold: SessionBankColdTier) -> some View {
-        let livePhysicalBytes = cold.livePhysicalBytes ?? cold.physicalBytes ?? cold.bytes ?? 0
-        let diskBytes = cold.managedDiskBytes ?? cold.managedFileBytes ?? livePhysicalBytes
-        let untrackedBytes = cold.untrackedFileBytes ?? cold.untrackedDiskBytes ?? 0
-        let logicalBytes = cold.logicalBytes
-        let maxBytes = cold.maxBytes
-        let scanPending = cold.diskUsageScanPending == true
-        HStack(spacing: 12) {
-            Image(systemName: "internaldrive")
-                .foregroundStyle(Brand.typeSecondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tr("Current usage"))
-                    .font(.caption2)
-                    .foregroundStyle(Brand.typeTertiary)
-                FlowLayout(spacing: 6) {
-                    Text(tr("disk %@", Format.bytes(diskBytes)))
-                        .font(.system(.callout, design: .rounded).weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(Brand.typeBody)
-                    if let maxBytes {
-                        Text(tr("/ cap %@", Format.bytes(maxBytes)))
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    if livePhysicalBytes != diskBytes {
-                        Text(tr("· live %@", Format.bytes(livePhysicalBytes)))
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    if untrackedBytes > 0 {
-                        Text(tr("· untracked %@", Format.bytes(untrackedBytes)))
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(Brand.warning)
-                    }
-                    if scanPending {
-                        Text(tr("\u{00B7} scanning"))
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    if let logicalBytes, logicalBytes != livePhysicalBytes {
-                        Text(tr("· logical %@", Format.bytes(logicalBytes)))
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    if let entries = cold.entries {
-                        Text(entries == 1 ? tr("· 1 entry") : tr("· %lld entries", entries))
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    if let ratio = cold.dedupeRatio, ratio > 0 {
-                        Text(tr("· %lld%% deduped", Int((ratio * 100).rounded())))
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                }
-            }
-            Spacer()
-            if cold.restorable == true {
-                PillBadge(
-                    text: tr("restorable"),
-                    systemImage: "checkmark.seal",
-                    tint: Brand.success
-                )
-            }
-        }
-        .padding(.top, 6)
     }
 
     /// Bridge the stored string list to a multi-line text field.
@@ -1695,10 +1599,10 @@ struct SettingsTab: View {
     }
 
     private var restartStatusText: String? {
-        switch backend.daemonRestartStatus {
+        switch projection.snapshot.daemonRestartStatus {
         case .idle:
             guard draftConfig.automaticDaemonRestart else { return nil }
-            switch backend.daemonRestartEligibility {
+            switch projection.snapshot.daemonRestartEligibility {
             case .adoptedPriorSession:
                 return tr("This adopted prior-session daemon is not protected. Start a fresh daemon.")
             case .currentSessionUnprotected:
@@ -1741,14 +1645,20 @@ struct SettingsTab: View {
     private func saveAndMaybeRestart(restart: Bool) {
         isApplying = true
         lastSaveError = nil
-        let config = normalizedDraftConfigurationForSave()
+        let persisted = backend.configuration
+        var config = normalizedDraftConfigurationForSave(against: persisted)
+        if config.model != persisted.model {
+            ModelPickerOverlay.normalizeModelScopedDefaults(&config, previousModel: persisted.model)
+        }
         // The draft store outlives this view, so a save that finishes
         // after the user has moved to another tab still lands.
         let drafts = self.drafts
+        let projection = self.projection
         Task {
             do {
                 try await backend.applyConfiguration(config, restartIfRunning: restart)
-                drafts.reset(to: config)
+                projection.refreshNow()
+                drafts.reset(to: backend.configuration)
             } catch {
                 drafts.lastSaveError = tr("Apply failed: %@", String(describing: error))
             }
@@ -1757,15 +1667,19 @@ struct SettingsTab: View {
     }
 
     private var settingsDirty: Bool {
-        normalizedDraftConfigurationForSave() != normalizedConfigurationForSave(backend.configuration)
+        normalizedDraftConfigurationForSave(against: persistedConfiguration)
+            != normalizedConfigurationForSave(persistedConfiguration)
     }
 
     private var settingsModelFamily: String {
-        MTPLXModelOption.modelFamily(for: draftConfig.model)
+        if draftConfig.model == persistedConfiguration.model {
+            return projection.snapshot.configuredModelFamily
+        }
+        return MTPLXModelOption.modelFamily(for: draftConfig.model)
     }
 
     private var compatibleSettings: MutableSettings? {
-        guard let settings = backend.settings else { return nil }
+        guard let settings = projection.snapshot.settings else { return nil }
         let settingsFamily = settings.modelControls?.modelFamily ?? settings.modelFamily
         guard let settingsFamily else {
             return MTPLXModelOption.supportsTune(family: settingsModelFamily) ? settings : nil
@@ -1774,7 +1688,7 @@ struct SettingsTab: View {
     }
 
     private var compatibleStartupControls: ModelControls? {
-        guard let controls = backend.health?.startup?.modelControls else { return nil }
+        guard let controls = projection.snapshot.startupModelControls else { return nil }
         if let modelRef = controls.modelRef {
             return MTPLXModelOption.modelsMatch(modelRef, draftConfig.model)
                 ? controls
@@ -1905,13 +1819,20 @@ struct SettingsTab: View {
         )
     }
 
-    private func normalizedDraftConfigurationForSave() -> MTPLXAppConfiguration {
-        normalizedConfigurationForSave(draftConfig)
+    private func normalizedDraftConfigurationForSave(
+        against persisted: MTPLXAppConfiguration
+    ) -> MTPLXAppConfiguration {
+        normalizedConfigurationForSave(drafts.mergedForSave(against: persisted))
     }
 
     private func normalizedConfigurationForSave(_ source: MTPLXAppConfiguration) -> MTPLXAppConfiguration {
         var config = source
-        let family = MTPLXModelOption.modelFamily(for: source.model)
+        let normalizedFanMode = MTPLXFanMode.normalized(config.fanMode)
+        config.fanMode = normalizedFanMode.rawValue
+        config.pinFansAtMaxOnStart = normalizedFanMode == .max
+        let family = source.model == persistedConfiguration.model
+            ? projection.snapshot.configuredModelFamily
+            : MTPLXModelOption.modelFamily(for: source.model)
         if let value = compatibleContextWindow(in: source, family: family) {
             config.contextWindow = Self.clampContextWindow(
                 value,
@@ -1961,6 +1882,447 @@ struct SettingsTab: View {
         return "\(value)"
     }
 
+    // Fan mode: single authoritative immediate-apply control (stopped or live).
+
+    private var activeFanMode: MTPLXFanMode {
+        optimisticFanMode ?? projection.snapshot.effectiveFanMode
+    }
+
+    private func commitFanMode(_ mode: MTPLXFanMode) {
+        guard !fanModePending else { return }
+        optimisticFanMode = mode
+        fanModePending = true
+        drafts.commitImmediateFanMode(mode)
+        let drafts = self.drafts
+        let projection = self.projection
+        Task { @MainActor in
+            do {
+                try await backend.setFanMode(mode.rawValue)
+                projection.refreshNow()
+                drafts.commitImmediateFanMode(backend.effectiveFanMode)
+                drafts.lastSaveError = nil
+            } catch {
+                projection.refreshNow()
+                drafts.commitImmediateFanMode(backend.effectiveFanMode)
+                drafts.lastSaveError = tr("Apply failed: %@", String(describing: error))
+            }
+            optimisticFanMode = nil
+            fanModePending = false
+        }
+    }
+}
+
+// MARK: - Isolated live-telemetry rows for Settings
+//
+// Each row subscribes to a tiny Equatable slice of `MTPLXBackendStore` so
+// 500ms SSE snapshots and 2s thermal polls only update that one info row
+// when its displayed values actually change, never the whole Settings page.
+
+private struct SettingsRAMCacheSummary: Equatable {
+    let totalNbytes: Int?
+    let entries: Int
+    let maxBytes: Int?
+
+    @MainActor
+    init?(backend: MTPLXBackendStore) {
+        guard let bank = backend.snapshot?.sessionBank else { return nil }
+        totalNbytes = bank.totalNbytes
+        entries = bank.entries ?? bank.prefixes?.count ?? 0
+        maxBytes = bank.maxBytes
+    }
+}
+
+@MainActor
+private final class SettingsRAMCacheProjection: ObservableObject {
+    @Published private(set) var summary: SettingsRAMCacheSummary?
+
+    private weak var backend: MTPLXBackendStore?
+    private var cancellable: AnyCancellable?
+    private var refreshPending = false
+
+    init(backend: MTPLXBackendStore) {
+        self.backend = backend
+        summary = SettingsRAMCacheSummary(backend: backend)
+        cancellable = backend.objectWillChange.sink { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            refreshPending = false
+            guard let backend else { return }
+            let next = SettingsRAMCacheSummary(backend: backend)
+            if next != summary {
+                summary = next
+            }
+        }
+    }
+}
+
+private struct SettingsRAMCacheUsageRow: View {
+    @StateObject private var projection: SettingsRAMCacheProjection
+
+    @MainActor
+    init(backend: MTPLXBackendStore) {
+        _projection = StateObject(
+            wrappedValue: SettingsRAMCacheProjection(backend: backend)
+        )
+    }
+
+    var body: some View {
+        if let summary = projection.summary {
+            SettingsInfoRow(item: .ramPolicy) {
+                HStack(spacing: 12) {
+                    Image(systemName: "memorychip")
+                        .foregroundStyle(Brand.typeSecondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tr("Current RAM cache"))
+                            .font(.caption2)
+                            .foregroundStyle(Brand.typeTertiary)
+                        HStack(spacing: 6) {
+                            Text(Format.bytes(summary.totalNbytes))
+                                .font(.system(.callout, design: .rounded).weight(.semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(Brand.typeBody)
+                            Text(summary.entries == 1 ? tr("· 1 entry") : tr("· %lld entries", summary.entries))
+                                .font(.caption)
+                                .foregroundStyle(Brand.typeSecondary)
+                            if let maxBytes = summary.maxBytes {
+                                Text(tr("· cap %@", Format.bytes(maxBytes)))
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(.top, 6)
+            }
+        }
+    }
+}
+
+@MainActor
+private final class SettingsSSDCacheProjection: ObservableObject {
+    @Published private(set) var coldTier: SessionBankColdTier?
+
+    private weak var backend: MTPLXBackendStore?
+    private var cancellable: AnyCancellable?
+    private var refreshPending = false
+
+    init(backend: MTPLXBackendStore) {
+        self.backend = backend
+        coldTier = backend.snapshot?.sessionBank.coldTier
+        cancellable = backend.objectWillChange.sink { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            refreshPending = false
+            guard let backend else { return }
+            let next = backend.snapshot?.sessionBank.coldTier
+            if next != coldTier {
+                coldTier = next
+            }
+        }
+    }
+}
+
+private struct SettingsSSDCacheUsageRow: View {
+    @StateObject private var projection: SettingsSSDCacheProjection
+
+    @MainActor
+    init(backend: MTPLXBackendStore) {
+        _projection = StateObject(
+            wrappedValue: SettingsSSDCacheProjection(backend: backend)
+        )
+    }
+
+    var body: some View {
+        if let cold = projection.coldTier {
+            SettingsInfoRow(item: .ssdPolicy) {
+                let livePhysicalBytes = cold.livePhysicalBytes ?? cold.physicalBytes ?? cold.bytes ?? 0
+                let diskBytes = cold.managedDiskBytes ?? cold.managedFileBytes ?? livePhysicalBytes
+                let untrackedBytes = cold.untrackedFileBytes ?? cold.untrackedDiskBytes ?? 0
+                let logicalBytes = cold.logicalBytes
+                let maxBytes = cold.maxBytes
+                let scanPending = cold.diskUsageScanPending == true
+                HStack(spacing: 12) {
+                    Image(systemName: "internaldrive")
+                        .foregroundStyle(Brand.typeSecondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tr("Current usage"))
+                            .font(.caption2)
+                            .foregroundStyle(Brand.typeTertiary)
+                        FlowLayout(spacing: 6) {
+                            Text(tr("disk %@", Format.bytes(diskBytes)))
+                                .font(.system(.callout, design: .rounded).weight(.semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(Brand.typeBody)
+                            if let maxBytes {
+                                Text(tr("/ cap %@", Format.bytes(maxBytes)))
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                            if livePhysicalBytes != diskBytes {
+                                Text(tr("· live %@", Format.bytes(livePhysicalBytes)))
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                            if untrackedBytes > 0 {
+                                Text(tr("· untracked %@", Format.bytes(untrackedBytes)))
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(Brand.warning)
+                            }
+                            if scanPending {
+                                Text(tr("\u{00B7} scanning"))
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                            if let logicalBytes, logicalBytes != livePhysicalBytes {
+                                Text(tr("· logical %@", Format.bytes(logicalBytes)))
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                            if let entries = cold.entries {
+                                Text(entries == 1 ? tr("· 1 entry") : tr("· %lld entries", entries))
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                            if let ratio = cold.dedupeRatio, ratio > 0 {
+                                Text(tr("· %lld%% deduped", Int((ratio * 100).rounded())))
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.typeSecondary)
+                            }
+                        }
+                    }
+                    Spacer()
+                    if cold.restorable == true {
+                        PillBadge(
+                            text: tr("restorable"),
+                            systemImage: "checkmark.seal",
+                            tint: Brand.success
+                        )
+                    }
+                }
+                .padding(.top, 6)
+            }
+        }
+    }
+}
+
+@MainActor
+private final class SettingsFanStatusProjection: ObservableObject {
+    @Published private(set) var fanRampVerified: Bool?
+
+    private weak var backend: MTPLXBackendStore?
+    private var cancellable: AnyCancellable?
+    private var refreshPending = false
+
+    init(backend: MTPLXBackendStore) {
+        self.backend = backend
+        fanRampVerified = Self.evaluate(backend.thermal)
+        cancellable = backend.objectWillChange.sink { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            refreshPending = false
+            guard let backend else { return }
+            let next = Self.evaluate(backend.thermal)
+            if next != fanRampVerified {
+                fanRampVerified = next
+            }
+        }
+    }
+
+    private static func evaluate(_ thermal: ThermalSnapshot?) -> Bool? {
+        guard let thermal, thermal.ok, let max = thermal.maxRpm else { return nil }
+        let fanRpms = thermal.fans.compactMap(\.actualRpm)
+        guard !fanRpms.isEmpty else { return nil }
+        return fanRpms.allSatisfy { Double($0) >= Double(max) * 0.9 }
+    }
+}
+
+private struct SettingsCoolingFanStatusRow: View {
+    let thermalPollingEnabled: Bool
+    @StateObject private var projection: SettingsFanStatusProjection
+
+    @MainActor
+    init(backend: MTPLXBackendStore, thermalPollingEnabled: Bool) {
+        self.thermalPollingEnabled = thermalPollingEnabled
+        _projection = StateObject(
+            wrappedValue: SettingsFanStatusProjection(backend: backend)
+        )
+    }
+
+    var body: some View {
+        if let verified = projection.fanRampVerified {
+            SettingsInfoRow(item: .fanMode) {
+                PillBadge(
+                    text: verified ? tr("fan ramp verified") : tr("fan ramp pending"),
+                    systemImage: verified ? "checkmark.seal.fill" : "clock",
+                    tint: verified ? Brand.success : Brand.warning,
+                    emphasized: !verified
+                )
+            }
+        } else if !thermalPollingEnabled {
+            SettingsInfoRow(item: .thermalPolling) {
+                Text(tr("Turn on Thermal Polling above to confirm fan state."))
+            }
+        }
+    }
+}
+
+private struct SettingsHermesGroup: View {
+    let backend: MTPLXBackendStore
+    @Binding var hermesWorkspacePath: String
+    let onChooseWorkspace: () -> Void
+    @EnvironmentObject private var hermes: HermesAgentStore
+
+    var body: some View {
+        SettingsGroup(group: .agents) {
+            SettingsRow(item: .agentWorkspace, layout: .stacked) {
+                HStack(spacing: 8) {
+                    TextField(
+                        MTPLXAppConfiguration.defaultHermesWorkspacePath(),
+                        text: $hermesWorkspacePath
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.callout, design: .monospaced))
+
+                    Button {
+                        onChooseWorkspace()
+                    } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help(tr("Choose agent workspace"))
+                    .accessibilityLabel(tr("Choose agent workspace"))
+                }
+            }
+            hermesRows
+        }
+        // Hermes is checked when its status is on screen, not on every
+        // visit to Settings: the check runs the Hermes command line.
+        .task {
+            await hermes.prepare(configuration: backend.configuration)
+        }
+    }
+
+    @ViewBuilder
+    private var hermesRows: some View {
+        SettingsRow(item: .hermes) {
+            HStack(spacing: 8) {
+                // The first check shows its spinner in the status line
+                // below; this one covers a refresh of a loaded status.
+                if case .checkingInstall = hermes.connectionState,
+                   hermes.installStatus != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Button {
+                    Task { await hermes.prepare(configuration: backend.configuration) }
+                } label: {
+                    Label(tr("Refresh"), systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        SettingsInfoRow(item: .hermes) {
+            if let status = hermes.installStatus {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 14, verticalSpacing: 6) {
+                    hermesStatusLine(tr("Tools"), status.enabledToolsets.joined(separator: ", "))
+                    if let version = status.versionSummary {
+                        hermesStatusLine(tr("Version"), version)
+                    }
+                    if let update = status.updateSummary {
+                        hermesStatusLine(tr("Update"), update, color: Brand.warning)
+                    }
+                    if let updateCommand = status.updateCommand, status.updateSummary != nil {
+                        hermesStatusLine(tr("Command"), updateCommand)
+                    }
+                    if let gateway = status.gatewaySummary {
+                        hermesStatusLine(tr("Gateway"), gateway, color: hermesGatewayColor(for: status.gatewayHealth))
+                    }
+                    if status.gatewayNeedsRepair {
+                        GridRow {
+                            Text(tr("Repair"))
+                                .foregroundStyle(Brand.typeTertiary)
+                            Button {
+                                Task { await hermes.repairGateway() }
+                            } label: {
+                                Label(
+                                    hermes.gatewayRepairInFlight ? tr("Repairing") : tr("Repair Gateway"),
+                                    systemImage: "arrow.triangle.2.circlepath"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(hermes.gatewayRepairInFlight)
+                        }
+                    }
+                    if let repairMessage = hermes.gatewayRepairMessage {
+                        hermesStatusLine(tr("Repair result"), repairMessage)
+                    }
+                    ForEach(status.integrationSummaries.prefix(3), id: \.self) { item in
+                        hermesStatusLine(tr("Messaging"), item)
+                    }
+                    ForEach(status.warnings.prefix(2), id: \.self) { warning in
+                        hermesStatusLine(tr("Warning"), warning, color: Brand.warning)
+                    }
+                    hermesStatusLine(tr("Capability"), status.capabilitySummary)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(tr("Checking Hermes"))
+                }
+            }
+        }
+    }
+
+    private func hermesStatusLine(
+        _ label: String,
+        _ value: String,
+        color: Color = Brand.typeSecondary
+    ) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(Brand.typeTertiary)
+            Text(value)
+                .font(.system(.callout, design: .rounded))
+                .foregroundStyle(color)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private func hermesGatewayColor(for health: HermesInstallStatus.GatewayHealth?) -> Color {
         switch health {
         case .healthy:
@@ -1971,29 +2333,4 @@ struct SettingsTab: View {
             return Brand.typeSecondary
         }
     }
-
-    private func statusText(
-        _ value: String,
-        color: Color = Brand.typeSecondary
-    ) -> some View {
-        Text(value)
-            .font(.system(.callout, design: .rounded))
-            .foregroundStyle(color)
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-
-    // Fan mode: the saved choice (Cooling section).
-
-    private var fanModeSelectionBinding: Binding<String> {
-        Binding(
-            get: { MTPLXFanMode.normalized(draftConfig.fanMode).rawValue },
-            set: { rawMode in
-                let mode = MTPLXFanMode.normalized(rawMode)
-                draftConfig.fanMode = mode.rawValue
-                draftConfig.pinFansAtMaxOnStart = mode == .max
-            }
-        )
-    }
-
 }

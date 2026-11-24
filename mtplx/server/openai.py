@@ -798,7 +798,20 @@ def _detach_exception_frames(exc: BaseException) -> BaseException:
 
 
 def _stream_error_queue_item(exc: BaseException) -> tuple[str, BaseException]:
-    return ("error", _detach_exception_frames(exc))
+    # Capture plain-text stack trace before detaching live traceback frames so
+    # mid-stream server logs still include the call stack without pinning any
+    # frame-local GPU caches (#422 / #415).
+    tb_text = ""
+    if exc.__traceback__ is not None:
+        with suppress(Exception):
+            tb_text = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).rstrip()
+    detached = _detach_exception_frames(exc)
+    if tb_text:
+        with suppress(Exception):
+            setattr(detached, "_mtplx_traceback_text", tb_text)
+    return ("error", detached)
 
 
 def _raise_if_stream_cancelled(
@@ -7688,6 +7701,11 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError as exc:
+                _log_stream_error(
+                    exc,
+                    request_id=message_id,
+                    path="/v1/messages",
+                )
                 yield _anthropic_sse(
                     "error",
                     {
@@ -7852,6 +7870,25 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
                             {"mtplx_stats": mtplx_stats}
                         ),
                     )
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:
+        _log_stream_error(
+            exc,
+            request_id=message_id,
+            path="/v1/messages",
+        )
+        yield _anthropic_sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": str(exc),
+                },
+            },
+        )
+        return
     finally:
         if hasattr(body_iterator, "aclose"):
             try:
@@ -17975,6 +18012,14 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         outcomes = getattr(state.dashboard, "prefill_outcomes", None)
         if outcomes is not None:
             outcomes.pop(str(record["request_id"]))
+    if "resolved_reasoning_effort" not in record:
+        req_effort = record.get("request_reasoning_effort")
+        if isinstance(req_effort, str) and req_effort.strip():
+            record["resolved_reasoning_effort"] = req_effort.strip().lower()
+        elif record.get("request_enable_thinking") is True:
+            resolved_effort = _resolved_reasoning_effort_for_state(state)
+            if resolved_effort is not None:
+                record["resolved_reasoning_effort"] = resolved_effort
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -19966,6 +20011,7 @@ DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     "preserve_thinking_effective",
     "reasoning_history_mode",
     "reasoning_policy",
+    "resolved_reasoning_effort",
     "restart_required_settings",
     "sampling_defaults",
     "support_level",
@@ -20487,7 +20533,9 @@ def _thermal_health_payload(
     actual_ramp_verified = os.environ.get("MTPLX_MAX_ACTUAL_RAMP_VERIFIED") == "1"
     smart = smart_status or {}
     smart_boost_active = fan_mode == FAN_MODE_SMART and bool(
-        smart.get("commanded_max") or smart.get("active")
+        smart.get("commanded_max")
+        or smart.get("active")
+        or int(smart.get("current_level") or 0) > 0
     )
     return {
         "max_requested": fan_mode == FAN_MODE_MAX
@@ -20794,8 +20842,12 @@ def _effective_ram_session_cache_settings(
     bank = getattr(getattr(state, "sessions", None), "bank", None)
     if bank is not None:
         entries = int(getattr(bank, "max_entries", entries))
-        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
-        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
+        bank_max_bytes = getattr(bank, "max_bytes", None)
+        if bank_max_bytes is not None:
+            max_bytes = f"{int(bank_max_bytes) / 2**30:.1f}G"
+        bank_per_session_bytes = getattr(bank, "per_session_max_bytes", None)
+        if bank_per_session_bytes is not None:
+            per_session_bytes = f"{int(bank_per_session_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
@@ -20958,6 +21010,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         "api_key_source": str(getattr(args, "api_key_source", "none") or "none"),
         "reasoning_parser": str(getattr(args, "reasoning_parser", "qwen3")),
         "reasoning_effort": str(getattr(args, "reasoning_effort", "auto") or "auto"),
+        "resolved_reasoning_effort": _resolved_reasoning_effort_for_state(state),
         "managed_client_controls": _managed_client_controls(state),
         "draft_temperature": (
             float(getattr(state.draft_sampler, "temperature"))
@@ -21218,6 +21271,165 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     }
 
 
+def _non_zero_session_nbytes(*candidates: Any) -> int:
+    """Return the first positive byte count from ``candidates``, else 0."""
+    for value in candidates:
+        try:
+            n = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return 0
+
+
+def _session_bank_held_bytes_for_session(bank: Any, session_id: str | None) -> int:
+    """Active RAM bytes currently held in ``bank`` for ``session_id``."""
+    if bank is None or not session_id:
+        return 0
+    held_fn = getattr(bank, "held_by_session", None)
+    if callable(held_fn):
+        try:
+            total = sum(
+                int(row.get("held_bytes") or 0)
+                for row in (held_fn() or ())
+                if row.get("session_id") == session_id
+            )
+            if total > 0:
+                return total
+        except Exception:
+            pass
+    return 0
+
+
+def _enrich_sessions_bytes_from_bank(
+    sessions_dict: dict[str, Any], bank_dict: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Backfill zero-byte session rows and hits from active SessionBank prefixes."""
+    sessions = sessions_dict.get("sessions")
+    prefixes = bank_dict.get("prefixes") if isinstance(bank_dict, Mapping) else None
+    if not isinstance(sessions, list) or not isinstance(prefixes, list):
+        return sessions_dict
+    held_by_sid: dict[str, int] = {}
+    hits_by_sid: dict[str, int] = {}
+    for prefix in prefixes:
+        if not isinstance(prefix, Mapping):
+            continue
+        sid = prefix.get("session_id")
+        if not sid:
+            continue
+        sid_key = str(sid)
+        entry_bytes = _non_zero_session_nbytes(
+            prefix.get("held_nbytes"),
+            prefix.get("nbytes"),
+        )
+        if entry_bytes > 0:
+            held_by_sid[sid_key] = held_by_sid.get(sid_key, 0) + entry_bytes
+        entry_hits = max(
+            int(prefix.get("cumulative_hits") or 0),
+            int(prefix.get("hits") or 0),
+        )
+        if entry_hits > 0:
+            hits_by_sid[sid_key] = hits_by_sid.get(sid_key, 0) + entry_hits
+    if not held_by_sid and not hits_by_sid:
+        return sessions_dict
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        sid_key = str(sid)
+        held = held_by_sid.get(sid_key, 0)
+        if held > 0:
+            if int(row.get("bytes") or 0) <= 0:
+                row["bytes"] = held
+            if int(row.get("held_nbytes") or 0) < held:
+                row["held_nbytes"] = held
+        hits = hits_by_sid.get(sid_key, 0)
+        if hits > 0:
+            if int(row.get("hits") or 0) < hits:
+                row["hits"] = hits
+            if int(row.get("cumulative_hits") or 0) < hits:
+                row["cumulative_hits"] = hits
+    return sessions_dict
+
+
+def _resolved_reasoning_effort_for_state(state: "ServerState") -> str | None:
+    """Effective default reasoning effort currently served by ``state``."""
+    args = getattr(state, "args", None)
+    if not bool(getattr(args, "enable_thinking", True)):
+        return None
+    try:
+        return _reasoning_effort_for_state(
+            state,
+            thinking_enabled=True,
+            request_effort=None,
+            allow_client_controls=False,
+        )
+    except Exception:
+        raw = getattr(args, "reasoning_effort", None)
+        if isinstance(raw, str) and raw.strip() and raw.strip().lower() != "auto":
+            return raw.strip().lower()
+        return None
+
+
+def _snapshot_profile_payload(state: "ServerState") -> dict[str, Any]:
+    """Build the live profile block for ``/v1/mtplx/snapshot``.
+
+    ``state.profile`` holds the static launch preset defaults (which point at
+    the default Qwen model and temp 0.6). Override model identity, family,
+    live default sampler values, and resolved reasoning effort with what the
+    loaded server actually serves.
+    """
+    profile_obj = getattr(state, "profile", None)
+    if hasattr(profile_obj, "to_dict"):
+        payload = dict(profile_obj.to_dict())
+    else:
+        payload = {"name": getattr(profile_obj, "name", "unknown")}
+
+    args = getattr(state, "args", None)
+    backend = _backend_descriptor(state)
+    model_id = str(getattr(state, "model_id", None) or getattr(args, "model", "") or "")
+    profile_default_model_id = payload.get("model_id")
+    if model_id and profile_default_model_id != model_id:
+        if profile_default_model_id is not None:
+            payload["profile_default_model_id"] = profile_default_model_id
+        payload["model_id"] = model_id
+
+    model_ref = str(getattr(args, "model", None) or model_id or "")
+    stripped_ref = model_ref.rstrip("/\\")
+    if stripped_ref and ("/" in stripped_ref or "\\" in stripped_ref):
+        model_name = Path(stripped_ref).name
+    else:
+        model_name = stripped_ref or getattr(backend, "display_name", None) or model_id
+    payload["model_name"] = model_name
+    payload["model_family"] = _model_family_for_state(state)
+
+    def _opt_float(attr: str, default: float) -> float:
+        val = getattr(args, attr, None)
+        return default if val is None else float(val)
+
+    def _opt_int(attr: str, default: int) -> int:
+        val = getattr(args, attr, None)
+        return default if val is None else int(val)
+
+    active_sampler = {
+        "temperature": _opt_float("temperature", 0.6),
+        "top_p": _opt_float("top_p", 0.95),
+        "top_k": _opt_int("top_k", 20),
+        "presence_penalty": _opt_float("default_presence_penalty", 0.0),
+    }
+    profile_default_sampler = payload.get("sampler")
+    if profile_default_sampler != active_sampler:
+        if profile_default_sampler is not None:
+            payload["profile_default_sampler"] = profile_default_sampler
+        payload["sampler"] = active_sampler
+
+    payload["resolved_reasoning_effort"] = _resolved_reasoning_effort_for_state(state)
+    return payload
+
+
 def _mtplx_dashboard_snapshot(
     state: "ServerState", *, rows: bool = True
 ) -> dict[str, Any]:
@@ -21236,6 +21448,7 @@ def _mtplx_dashboard_snapshot(
     try:
         sessions_dict = state.sessions.list_sessions()
         bank_dict = sessions_dict.get("session_bank") or {}
+        sessions_dict = _enrich_sessions_bytes_from_bank(sessions_dict, bank_dict)
     except Exception as exc:
         sessions_dict = {
             "sessions": [],
@@ -21245,15 +21458,15 @@ def _mtplx_dashboard_snapshot(
         }
         bank_dict = {}
     retrieval = getattr(state, "retrieval", None)
+    resolved_effort = _resolved_reasoning_effort_for_state(state)
     snapshot = {
         "ts": time.time(),
         "model_id": state.model_id,
         # Always present, so a client can tell "no retrieval configured" apart
         # from "this build has no retrieval support".
         "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
-        "profile": state.profile.to_dict()
-        if hasattr(state.profile, "to_dict")
-        else {"name": getattr(state.profile, "name", "unknown")},
+        "profile": _snapshot_profile_payload(state),
+        "resolved_reasoning_effort": resolved_effort,
         "context_window": state.context_window,
         "active_requests": state.dashboard.in_flight.count(),
         "in_flight": dashboard.in_flight.snapshot(),
@@ -23276,7 +23489,12 @@ def _admission_geometry(state: Any, prefill_width: int | None = None) -> _Admiss
         windows_fn = getattr(runtime, "prefill_window_bytes", None)
         if callable(windows_fn):
 
-            def prefill_windows(prompt: int, new: int) -> int:
+            def prefill_windows(prompt: int, new: int, *, leased: bool = False) -> int:
+                if leased:
+                    try:
+                        return int(windows_fn(prompt, new, prefill_width, leased=True) or 0)
+                    except TypeError:
+                        pass
                 return int(windows_fn(prompt, new, prefill_width) or 0)
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
@@ -23967,6 +24185,15 @@ def _admission_quant_working(
     }
 
 
+def _call_prefill_windows(fn: Any, prompt: int, new: int, *, leased: bool = False) -> int:
+    if leased:
+        try:
+            return int(fn(prompt, new, leased=True) or 0)
+        except TypeError:
+            pass
+    return int(fn(prompt, new) or 0)
+
+
 def _admission_growth(
     geometry: _AdmissionGeometry,
     *,
@@ -24091,7 +24318,12 @@ def _admission_growth(
         # the larger of the two is held.
         row_width = geometry.resident_width
         own_windows = geometry.prefill_windows is not None
-        new_fixed = int(geometry.prefill_windows(P, M)) if own_windows and M else 0
+        leased_in_place = bool(R > 0 and not restore_copies_prefix)
+        new_fixed = (
+            _call_prefill_windows(geometry.prefill_windows, P, M, leased=leased_in_place)
+            if own_windows and M
+            else 0
+        )
         restore_fixed = 0
         if restore_rows:
             restore_fixed = int(geometry.resident_fixed_bytes)
@@ -24162,7 +24394,7 @@ def _admission_growth(
             # What the pre-decode clone keeps: the prefill's windows, or the
             # restored entry's when nothing was prefilled.
             if M:
-                windows_after = int(geometry.prefill_windows(P, M))
+                windows_after = _call_prefill_windows(geometry.prefill_windows, P, M)
             elif restore_rows and restore_fixed_bytes is not None:
                 windows_after = int(restore_fixed_bytes)
         live_total = P * geometry.resident_width + windows_after
@@ -27642,6 +27874,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "request_enable_thinking_override",
     "request_reasoning_mode",
     "request_reasoning_parser",
+    "resolved_reasoning_effort",
     "request_temperature",
     "request_top_p",
     "request_top_k",
@@ -27696,6 +27929,10 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "cache_memory_bytes",
     "reasoning_reentries",
     "reasoning_tokens",
+    "reasoning_s",
+    "first_visible_s",
+    "first_visible_kind",
+    "first_answer_s",
     "answer_tokens",
     # Stamped only when finish=length cut the turn inside reasoning and left
     # content empty (#F3), so quiet envelopes stay byte-stable.
@@ -27977,6 +28214,10 @@ def _merge_final_bridge_stats_into_latest_metrics(
         "read_only_force_answer_visible_tokens",
         "session_prompt_prefix_commit",
         "session_postcommit_snapshot",
+        "first_visible_s",
+        "first_visible_kind",
+        "first_answer_s",
+        "resolved_reasoning_effort",
         "finish_reason",
     ):
         if key in stats:
@@ -28109,6 +28350,51 @@ def _stream_error_detail(error: BaseException) -> str:
     return text[:400]
 
 
+def _log_stream_error(
+    exc: BaseException,
+    *,
+    request_id: str,
+    path: str,
+    session_id: str | None = None,
+    streamed_tokens: int = 0,
+) -> None:
+    """Log mid-stream exceptions with stack/context after SSE has started."""
+
+    tb_text = (
+        getattr(exc, "_mtplx_traceback_text", None)
+        if exc.__traceback__ is None
+        else None
+    )
+    if tb_text:
+        logging.getLogger("mtplx.server").error(
+            "unhandled streaming error request_id=%s path=%s session_id=%s "
+            "streamed_tokens=%d: %s: %s\n%s",
+            request_id,
+            path,
+            session_id or "-",
+            int(streamed_tokens),
+            type(exc).__name__,
+            exc,
+            tb_text,
+        )
+        return
+    logging.getLogger("mtplx.server").error(
+        "unhandled streaming error request_id=%s path=%s session_id=%s "
+        "streamed_tokens=%d: %s: %s",
+        request_id,
+        path,
+        session_id or "-",
+        int(streamed_tokens),
+        type(exc).__name__,
+        exc,
+        exc_info=(
+            (type(exc), exc, exc.__traceback__)
+            if exc.__traceback__ is not None
+            else None
+        ),
+    )
+
+
 def _record_stream_error_metric(
     state: ServerState,
     *,
@@ -28186,6 +28472,24 @@ def _record_stream_error_metric(
     _record_request_metrics(state, envelope)
     if not bool(envelope.get("warmup")):
         state.last_request_at = time.time()
+    if not bool(envelope.get("warmup")) and not _server_console_enabled(state):
+        _safe_stdout_print(
+            json.dumps(
+                {
+                    "event": "mtplx_openai_generation",
+                    "request_id": response_id,
+                    "mode": mode,
+                    "prompt_tokens": int(prompt_tokens),
+                    "completion_tokens": streamed_tokens,
+                    "finish_reason": "error",
+                    "error_kind": error_kind,
+                    "error_status": error_status,
+                    "error_detail": envelope["error_detail"],
+                    "elapsed_s": round(elapsed_s, 6),
+                },
+                ensure_ascii=False,
+            )
+        )
     try:
         state.dashboard.bus.publish(
             {
@@ -29166,7 +29470,11 @@ def _store_retokenized_history_snapshot(
                     commit = session.commit_retokenized_prefix(
                         token_ids=history_bank_ids,
                         expected_revision=expected_session_revision,
-                        nbytes=0,
+                        nbytes=_non_zero_session_nbytes(
+                            estimated_nbytes,
+                            best_prefix_nbytes,
+                            getattr(session, "bytes_estimate", 0),
+                        ),
                     )
                     outcome["session_commit"] = {
                         "committed": bool(commit.committed),
@@ -29366,7 +29674,12 @@ def _store_retokenized_history_snapshot(
             commit = session.commit_retokenized_prefix(
                 token_ids=history_bank_ids,
                 expected_revision=expected_session_revision,
-                nbytes=int(entry.nbytes),
+                nbytes=_non_zero_session_nbytes(
+                    getattr(entry, "held_nbytes", 0),
+                    getattr(entry, "nbytes", 0),
+                    oversized_nbytes_override,
+                    getattr(session, "bytes_estimate", 0),
+                ),
             )
             session_commit = {
                 "committed": bool(commit.committed),
@@ -29384,6 +29697,7 @@ def _store_retokenized_history_snapshot(
         "mode": "retokenized_history",
         "prefix_len": entry.prefix_len,
         "nbytes": entry.nbytes,
+        "held_nbytes": int(getattr(entry, "held_nbytes", 0) or entry.nbytes),
         "elapsed_s": time.perf_counter() - started,
         "token_hash": entry.token_hash,
         # Observability for the prefix-reuse shortcut: lets operators tell
@@ -30080,7 +30394,39 @@ def _generation_final_bank_values(
     )
     if boundaries:
         values["gdn_boundaries"] = boundaries
+    boundary_logits = _generation_final_prompt_boundary_logits(
+        final_state, prompt_ids=prompt_ids, final_token_ids=values["token_ids"]
+    )
+    if boundary_logits is not None:
+        values["boundary_logits"] = boundary_logits
     return values
+
+
+def _generation_final_prompt_boundary_logits(
+    final_state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+) -> tuple[int, Any] | None:
+    """Prompt-end logits carried into the generation-final entry.
+
+    Clone-restored turns with zero suffix tokens skip the prompt-prefix bank
+    commit before decode, so the generation-final entry has no superseded
+    prompt lease to inherit prompt-end logits from. Carrying the prompt
+    boundary logits here keeps a subsequent repeat of the same prompt on the
+    boundary-restore path without declining for missing boundary logits.
+    """
+
+    prompt_logits = getattr(final_state, "prompt_boundary_logits", None)
+    prompt_len = len(prompt_ids)
+    if prompt_logits is None or prompt_len <= 0 or len(final_token_ids) <= prompt_len:
+        return None
+    if any(
+        int(prompt_token) != int(final_token)
+        for prompt_token, final_token in zip(prompt_ids, final_token_ids)
+    ):
+        return None
+    return (prompt_len, prompt_logits)
 
 
 def _generation_final_prompt_boundaries(
@@ -30378,6 +30724,10 @@ def _store_generation_final_history_snapshot(
             **bank_values,
             **bank_metadata,
         )
+        if "boundary_logits" in put_kwargs and not _callable_accepts_keyword(
+            bank.put, "boundary_logits"
+        ):
+            put_kwargs.pop("boundary_logits", None)
         # The bank's own per-phase receipt (trunk snapshot, entry build,
         # cold-tier dispatch, settle dispatch); test doubles without the
         # keyword keep their exact contract.
@@ -30418,6 +30768,7 @@ def _store_generation_final_history_snapshot(
         ),
         "prefix_len": entry.prefix_len,
         "nbytes": entry.nbytes,
+        "held_nbytes": int(getattr(entry, "held_nbytes", 0) or entry.nbytes),
         "elapsed_s": time.perf_counter() - started,
         "history_suffix_tokens": (
             0
@@ -30518,21 +30869,36 @@ class _StreamVisibility:
     answer text or tool call, the end of the wait a user watches the model
     think through (12 Nov: Pi at xhigh had its first token at a median 0.74 s
     and its first answer or tool call at a median 5.5 s, 34.6 s at 88K; the
-    request log said only the first). None when the stream sent none.
+    request log said only the first). ``first_visible_kind`` distinguishes
+    ``"text"`` from ``"tool_call"`` (or ``None`` when neither was emitted),
+    and ``first_answer_s`` records the first user-visible text delta only.
     """
 
-    __slots__ = ("origin_s", "last_reasoning_s", "first_visible_s")
+    __slots__ = (
+        "origin_s",
+        "last_reasoning_s",
+        "first_visible_s",
+        "first_visible_kind",
+        "first_answer_s",
+    )
 
     def __init__(self, origin_s: float) -> None:
         self.origin_s = float(origin_s)
         self.last_reasoning_s: float | None = None
         self.first_visible_s: float | None = None
+        self.first_visible_kind: str | None = None
+        self.first_answer_s: float | None = None
 
     def saw(self, channel: str | None, sent_s: float) -> None:
         if channel == "reasoning":
             self.last_reasoning_s = sent_s
-        elif channel is not None and self.first_visible_s is None:
-            self.first_visible_s = sent_s
+        elif channel is not None:
+            kind = "text" if channel == "answer" else channel
+            if self.first_visible_s is None:
+                self.first_visible_s = sent_s
+                self.first_visible_kind = kind
+            if channel == "answer" and self.first_answer_s is None:
+                self.first_answer_s = sent_s
 
     def fields(self, reasoning_tokens: Any) -> dict[str, Any]:
         def since_arrival(sent_s: float | None) -> float | None:
@@ -30544,6 +30910,8 @@ class _StreamVisibility:
             ),
             "reasoning_s": since_arrival(self.last_reasoning_s),
             "first_visible_s": since_arrival(self.first_visible_s),
+            "first_visible_kind": self.first_visible_kind,
+            "first_answer_s": since_arrival(self.first_answer_s),
         }
 
 
@@ -32284,7 +32652,11 @@ def _build_mtp_batch_session_hooks(
                     or not min_restore_tokens <= restore_point < len(tokens)
                 ):
                     continue
-                entry.hits += 1
+                mark_hit = getattr(session_bank, "mark_prefix_hit", None)
+                if callable(mark_hit):
+                    mark_hit(entry, source="ram")
+                else:
+                    entry.hits += 1
                 entry.last_access_s = time.time()
                 outcome.update(
                     {
@@ -34386,6 +34758,10 @@ def _run_generation(
                 final_state,
                 token_count=len(bank_token_ids),
             )
+            if "boundary_logits" in bank_values and not _callable_accepts_keyword(
+                session_bank.put, "boundary_logits"
+            ):
+                bank_values.pop("boundary_logits", None)
             final_entry = session_bank.put(
                 runtime=state.runtime,
                 token_ids=bank_token_ids,
@@ -39415,7 +39791,11 @@ def create_app(state: ServerState) -> FastAPI:
         smart_status = _smart_fan_status(state)
         fan_boost_active = fan_mode == FAN_MODE_MAX or (
             fan_mode == FAN_MODE_SMART
-            and bool(smart_status.get("commanded_max") or smart_status.get("active"))
+            and bool(
+                smart_status.get("commanded_max")
+                or smart_status.get("active")
+                or int(smart_status.get("current_level") or 0) > 0
+            )
         )
         runtime_mode = _health_runtime_mode_label(
             state.profile.name,
@@ -40595,7 +40975,10 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.get("/admin/sessions")
     def admin_sessions() -> dict[str, Any]:
-        return state.sessions.list_sessions()
+        sessions_dict = state.sessions.list_sessions()
+        return _enrich_sessions_bytes_from_bank(
+            sessions_dict, sessions_dict.get("session_bank") or {}
+        )
 
     @app.post("/admin/sessions/{session_id}/clear")
     def admin_clear_session(session_id: str) -> dict[str, Any]:
@@ -41887,6 +42270,15 @@ def create_app(state: ServerState) -> FastAPI:
                         prompt_ids=frontier_prompt_ids,
                         generated_ids=generated_result["tokens"],
                         finish_reason=generated_result.get("finish_reason", "stop"),
+                        nbytes=_non_zero_session_nbytes(
+                            (generated_result.get("stats") or {}).get(
+                                "sessionbank_snapshot_bytes"
+                            ),
+                            _session_bank_held_bytes_for_session(
+                                session_bank_for_generation, session_id
+                            ),
+                            getattr(session, "bytes_estimate", 0),
+                        ),
                     )
                 return generated_result
 
@@ -43081,6 +43473,18 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                             boundary_kind=prompt_prefix_boundary_kind,
                         )
+                        if int(getattr(session, "bytes_estimate", 0) or 0) <= 0:
+                            held_bytes = _non_zero_session_nbytes(
+                                (generated.get("stats") or {}).get(
+                                    "sessionbank_snapshot_bytes"
+                                ),
+                                _session_bank_held_bytes_for_session(
+                                    getattr(state.sessions, "bank", None),
+                                    session_id,
+                                ),
+                            )
+                            if held_bytes > 0:
+                                session.bytes_estimate = held_bytes
                         prompt_prefix_commit_info = {
                             "committed": bool(
                                 prompt_prefix_commit.committed
@@ -43464,7 +43868,18 @@ def create_app(state: ServerState) -> FastAPI:
                                             finish_reason=generated.get(
                                                 "finish_reason", "stop"
                                             ),
-                                            nbytes=int(postcommit.get("nbytes") or 0),
+                                            nbytes=_non_zero_session_nbytes(
+                                                postcommit.get("held_nbytes"),
+                                                postcommit.get("nbytes"),
+                                                (generated.get("stats") or {}).get(
+                                                    "sessionbank_snapshot_bytes"
+                                                ),
+                                                _session_bank_held_bytes_for_session(
+                                                    getattr(state.sessions, "bank", None),
+                                                    session_id,
+                                                ),
+                                                getattr(session, "bytes_estimate", 0),
+                                            ),
                                         )
                                     hand_off_commit("committed", generated, postcommit)
                                 else:
@@ -44063,6 +44478,10 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_cancelled_by_client = False
                 cancelled_metric_recorded = False
                 stream_error_item: BaseException | None = None
+                stream_path = str(
+                    getattr(getattr(raw_request, "url", None), "path", None)
+                    or "/v1/chat/completions"
+                )
                 try:
                     for field, text in splitter.start():
                         if text:
@@ -44994,6 +45413,36 @@ def create_app(state: ServerState) -> FastAPI:
                                         "session_postcommit_snapshot"
                                     ] = commit_item
                                 elif commit_kind == "error":
+                                    commit_err = (
+                                        commit_item
+                                        if isinstance(commit_item, BaseException)
+                                        else RuntimeError(str(commit_item))
+                                    )
+                                    _log_stream_error(
+                                        commit_err,
+                                        request_id=response_id,
+                                        path=stream_path,
+                                        session_id=session_id,
+                                        streamed_tokens=streamed_progress_tokens,
+                                    )
+                                    if not cancelled_metric_recorded:
+                                        _record_stream_error_metric(
+                                            state,
+                                            response_id=response_id,
+                                            session_id=session_id,
+                                            prompt_tokens=len(prompt_ids),
+                                            streamed_completion_tokens=(
+                                                streamed_progress_tokens
+                                            ),
+                                            stream_started_s=stream_started_s,
+                                            error=commit_err,
+                                            request_observability=request_observability,
+                                            client_disconnected=(
+                                                stream_cancelled_by_client
+                                            ),
+                                            token_times=streamed_token_times,
+                                        )
+                                        cancelled_metric_recorded = True
                                     yield mark_sse_sent(error_chunk(commit_item))
                                     yield mark_sse_sent("data: [DONE]\n\n")
                                     return
@@ -45017,13 +45466,35 @@ def create_app(state: ServerState) -> FastAPI:
                                         assistant_tool_calls=assistant_tool_calls,
                                     )
                                 else:
-                                    yield mark_sse_sent(
-                                        error_chunk(
-                                            RuntimeError(
-                                                f"unexpected commit event: {commit_kind}"
-                                            )
-                                        )
+                                    commit_err = RuntimeError(
+                                        f"unexpected commit event: {commit_kind}"
                                     )
+                                    _log_stream_error(
+                                        commit_err,
+                                        request_id=response_id,
+                                        path=stream_path,
+                                        session_id=session_id,
+                                        streamed_tokens=streamed_progress_tokens,
+                                    )
+                                    if not cancelled_metric_recorded:
+                                        _record_stream_error_metric(
+                                            state,
+                                            response_id=response_id,
+                                            session_id=session_id,
+                                            prompt_tokens=len(prompt_ids),
+                                            streamed_completion_tokens=(
+                                                streamed_progress_tokens
+                                            ),
+                                            stream_started_s=stream_started_s,
+                                            error=commit_err,
+                                            request_observability=request_observability,
+                                            client_disconnected=(
+                                                stream_cancelled_by_client
+                                            ),
+                                            token_times=streamed_token_times,
+                                        )
+                                        cancelled_metric_recorded = True
+                                    yield mark_sse_sent(error_chunk(commit_err))
                                     yield mark_sse_sent("data: [DONE]\n\n")
                                     return
                             generated = attach_response_observability(generated)
@@ -45136,6 +45607,15 @@ def create_app(state: ServerState) -> FastAPI:
                         elif kind == "error":
                             if isinstance(item, BaseException):
                                 stream_error_item = item
+                            else:
+                                stream_error_item = RuntimeError(str(item))
+                            _log_stream_error(
+                                stream_error_item,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=session_id,
+                                streamed_tokens=streamed_progress_tokens,
+                            )
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
@@ -45234,11 +45714,18 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         else:
-                            yield mark_sse_sent(
-                                error_chunk(
-                                    RuntimeError(f"unexpected stream event: {kind}")
-                                )
+                            unexpected_err = RuntimeError(
+                                f"unexpected stream event: {kind}"
                             )
+                            stream_error_item = unexpected_err
+                            _log_stream_error(
+                                unexpected_err,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=session_id,
+                                streamed_tokens=streamed_progress_tokens,
+                            )
+                            yield mark_sse_sent(error_chunk(unexpected_err))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
                 except asyncio.CancelledError:
@@ -45258,6 +45745,14 @@ def create_app(state: ServerState) -> FastAPI:
                     stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
+                    stream_error_item = exc
+                    _log_stream_error(
+                        exc,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=session_id,
+                        streamed_tokens=streamed_progress_tokens,
+                    )
                     yield mark_sse_sent(error_chunk(exc))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
@@ -45342,9 +45837,29 @@ def create_app(state: ServerState) -> FastAPI:
                     )
 
                 if generated is None:
-                    yield mark_sse_sent(
-                        error_chunk(RuntimeError("generation ended without a result"))
+                    missing_err = RuntimeError("generation ended without a result")
+                    _log_stream_error(
+                        missing_err,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=session_id,
+                        streamed_tokens=streamed_progress_tokens,
                     )
+                    if not cancelled_metric_recorded:
+                        _record_stream_error_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=session_id,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_progress_tokens,
+                            stream_started_s=stream_started_s,
+                            error=missing_err,
+                            request_observability=request_observability,
+                            client_disconnected=stream_cancelled_by_client,
+                            token_times=streamed_token_times,
+                        )
+                        cancelled_metric_recorded = True
+                    yield mark_sse_sent(error_chunk(missing_err))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
                 finish_reason = generated.get("finish_reason") or "stop"
@@ -45583,12 +46098,15 @@ def create_app(state: ServerState) -> FastAPI:
                 response_id=response_id,
                 stream=False,
             )
-            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             assistant_content = (
                 extraction.cleaned_text.strip()
                 if extraction is not None and extraction.cleaned_text
                 else ""
             )
+            generated["stats"]["first_visible_kind"] = (
+                "text" if assistant_content else "tool_call"
+            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=assistant_content,
@@ -45704,6 +46222,9 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["stats"]["finish_reason"] = "stop"
                     generated["stats"]["stop_sequence_hit"] = True
                     generated["stats"]["stop_sequence_matched"] = matched_stop
+            generated["stats"]["first_visible_kind"] = (
+                "text" if display_text else None
+            )
             _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,
@@ -46033,6 +46554,12 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_completion_tokens = 0
                 stream_started_s = time.perf_counter()
                 completion_client_disconnected = False
+                stream_error_item: BaseException | None = None
+                stream_error_metric_recorded = False
+                stream_path = str(
+                    getattr(getattr(raw_request, "url", None), "path", None)
+                    or "/v1/completions"
+                )
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
@@ -46317,13 +46844,34 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield "data: [DONE]\n\n"
                             return
                         elif kind == "error":
+                            stream_error_item = (
+                                item
+                                if isinstance(item, BaseException)
+                                else RuntimeError(str(item))
+                            )
+                            _log_stream_error(
+                                stream_error_item,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=None,
+                                streamed_tokens=streamed_completion_tokens,
+                            )
                             yield error_chunk(item)
                             yield "data: [DONE]\n\n"
                             return
                         else:
-                            yield error_chunk(
-                                RuntimeError(f"unexpected stream event: {kind}")
+                            unexpected_err = RuntimeError(
+                                f"unexpected stream event: {kind}"
                             )
+                            stream_error_item = unexpected_err
+                            _log_stream_error(
+                                unexpected_err,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=None,
+                                streamed_tokens=streamed_completion_tokens,
+                            )
+                            yield error_chunk(unexpected_err)
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
@@ -46337,8 +46885,19 @@ def create_app(state: ServerState) -> FastAPI:
                     # from the catch-all below would raise "async generator
                     # ignored GeneratorExit". Re-raise untouched (#F36).
                     completion_client_disconnected = True
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except BaseException as exc:
+                    stream_error_item = exc
+                    _log_stream_error(
+                        exc,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=None,
+                        streamed_tokens=streamed_completion_tokens,
+                    )
                     yield error_chunk(exc)
                     yield "data: [DONE]\n\n"
                     return
@@ -46346,7 +46905,9 @@ def create_app(state: ServerState) -> FastAPI:
                     # Snapshot before teardown trips the event on every exit,
                     # and record before deregistering: the dashboard, request
                     # log and bus event are what prove the Stop reached us.
-                    cancelled = cancel_event.is_set() and generated is None
+                    cancelled = (
+                        cancel_event.is_set() or completion_client_disconnected
+                    ) and generated is None
                     cancel_reason = (
                         "client_disconnected"
                         if completion_client_disconnected
@@ -46358,7 +46919,21 @@ def create_app(state: ServerState) -> FastAPI:
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="stream_teardown"
                     )
-                    if cancelled:
+                    if stream_error_item is not None and generated is None:
+                        if not stream_error_metric_recorded:
+                            _record_stream_error_metric(
+                                state,
+                                response_id=response_id,
+                                session_id=None,
+                                prompt_tokens=len(prompt_ids),
+                                streamed_completion_tokens=streamed_completion_tokens,
+                                stream_started_s=stream_started_s,
+                                error=stream_error_item,
+                                request_observability=request_observability,
+                                client_disconnected=completion_client_disconnected,
+                            )
+                            stream_error_metric_recorded = True
+                    elif cancelled:
                         state.dashboard.lifetime.record_cancellation()
                         _record_stream_cancellation_metric(
                             state,
@@ -46376,7 +46951,28 @@ def create_app(state: ServerState) -> FastAPI:
                     _flight(state).sweep(response_id)
 
                 if generated is None:
-                    yield error_chunk(RuntimeError("generation ended without a result"))
+                    missing_err = RuntimeError("generation ended without a result")
+                    _log_stream_error(
+                        missing_err,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=None,
+                        streamed_tokens=streamed_completion_tokens,
+                    )
+                    if not stream_error_metric_recorded:
+                        _record_stream_error_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=None,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_completion_tokens,
+                            stream_started_s=stream_started_s,
+                            error=missing_err,
+                            request_observability=request_observability,
+                            client_disconnected=completion_client_disconnected,
+                        )
+                        stream_error_metric_recorded = True
+                    yield error_chunk(missing_err)
                     yield "data: [DONE]\n\n"
                     return
                 finish_reason = str(generated.get("finish_reason") or "stop")

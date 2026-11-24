@@ -12,6 +12,22 @@ struct SystemTab: View {
     @EnvironmentObject private var backend: MTPLXBackendStore
     @EnvironmentObject private var router: AppRouter
 
+    private var shouldRefreshThermal: Bool {
+        let kind = backend.daemonState.kind
+        return kind == .running || kind == .warming
+    }
+
+    private var coolingReadout: SystemCoolingReadout {
+        SystemCoolingReadout(
+            pollingEnabled: backend.configuration.enableThermalPolling,
+            thermal: backend.thermal,
+            thermalStatus: backend.thermalStatus,
+            health: backend.health,
+            currentFanMode: backend.currentFanMode,
+            configuredFanMode: backend.configuration.fanMode
+        )
+    }
+
     var body: some View {
         Group {
             if backend.daemonState.kind == .stopped {
@@ -31,8 +47,25 @@ struct SystemTab: View {
                         ruleCard
                         fansCard
                     }
-                    .padding(20)
+                    .padding(.top, 20)
+                    .padding(.horizontal, 20)
+                    .padding(
+                        .bottom,
+                        DashboardLayout.scrollBottomPadding(
+                            daemonRunning: backend.daemonState.kind == .running
+                        )
+                    )
                 }
+            }
+        }
+        // Refresh thermal status ONLY while SystemTab is visible and the daemon
+        // is running or warming — surfaces active fan mode and live RPMs
+        // without enabling background Thermal Polling behind the user's back.
+        .task(id: shouldRefreshThermal) {
+            guard shouldRefreshThermal else { return }
+            while !Task.isCancelled {
+                await backend.refreshThermalStatus()
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
@@ -368,26 +401,52 @@ struct SystemTab: View {
 
     @ViewBuilder
     private var ruleCard: some View {
-        let pollingEnabled = backend.configuration.enableThermalPolling
+        let cooling = coolingReadout
+        let badgeTint: Color = {
+            switch cooling.activeFanMode {
+            case .max: return Brand.success
+            case .smart: return Brand.accentChrome
+            case .default: return Brand.textHighlight.opacity(0.75)
+            }
+        }()
 
         Card(tr("Cooling"), padding: 16) {
             PillBadge(
-                text: pollingEnabled ? tr("Monitoring fans") : tr("Fans not monitored"),
-                systemImage: pollingEnabled ? "checkmark.seal.fill" : "exclamationmark.triangle",
-                tint: pollingEnabled ? Brand.success : Brand.warning,
-                emphasized: !pollingEnabled
+                text: cooling.coolingBadgeText,
+                systemImage: cooling.activeFanMode == .max ? "fan.fill" : "fan",
+                tint: badgeTint,
+                emphasized: cooling.activeFanMode == .max
             )
         } content: {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(tr("For accurate benchmarks, your fans need to be at max. Thermal throttling makes numbers meaningless."))
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(spacing: 6) {
+                    MetricRow(
+                        label: tr("Fan mode"),
+                        value: cooling.activeFanMode.title,
+                        valueTint: badgeTint
+                    )
+                    if let thermalState = cooling.thermalStateLabel {
+                        MetricRow(
+                            label: tr("Thermal state"),
+                            value: thermalState,
+                            valueTint: cooling.isThrottling ? Brand.warning : Brand.success
+                        )
+                    }
+                    MetricRow(
+                        label: tr("Thermal Polling"),
+                        value: cooling.pollingBadgeText,
+                        valueTint: cooling.pollingEnabled ? Brand.success : Brand.textHighlight.opacity(0.75)
+                    )
+                }
+                Text(cooling.activeFanMode.help)
                     .font(.callout)
                     .foregroundStyle(Brand.textHighlight)
-                Text(tr("Turn on Thermal Polling in Settings to confirm. Performance Lock also calms the UI so it doesn't compete with the model."))
-                    .font(.caption)
-                    .foregroundStyle(Brand.textHighlight.opacity(0.65))
-                if !pollingEnabled {
-                    openCoolingSettingsButton
+                if !cooling.pollingEnabled {
+                    Text(tr("Background thermal polling is off; fan mode and RPMs refresh live while System is open."))
+                        .font(.caption)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.65))
                 }
+                openCoolingSettingsButton
             }
         }
     }
@@ -404,37 +463,30 @@ struct SystemTab: View {
 
     @ViewBuilder
     private var fansCard: some View {
-        let thermal = backend.thermal
-        let pollingEnabled = backend.configuration.enableThermalPolling
+        let cooling = coolingReadout
+        let thermal = cooling.snapshot
 
         Card(tr("Fans")) {
-            if pollingEnabled, let thermal, thermal.ok, !thermal.fans.isEmpty {
-                HStack(alignment: .top, spacing: 24) {
-                    ForEach(Array(thermal.fans.enumerated()), id: \.offset) { idx, fan in
-                        FanRing(
-                            label: tr("Fan %lld", idx + 1),
-                            actualRpm: fan.actualRpm,
-                            targetRpm: fan.targetRpm,
-                            minRpm: thermal.minRpm,
-                            maxRpm: fan.maxCapacityRpm ?? thermal.maxRpm,
-                            mode: fan.mode
-                        )
+            if let thermal, thermal.ok, !thermal.fans.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top, spacing: 24) {
+                        ForEach(Array(thermal.fans.enumerated()), id: \.offset) { idx, fan in
+                            FanRing(
+                                label: tr("Fan %lld", idx + 1),
+                                actualRpm: fan.effectiveRpm,
+                                targetRpm: fan.targetRpm,
+                                minRpm: fan.minCapacityRpm,
+                                maxRpm: fan.maxCapacityRpm ?? thermal.capacityMaxRpm ?? thermal.maxRpm,
+                                mode: fan.mode ?? cooling.activeFanMode.rawValue
+                            )
+                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
-            } else if pollingEnabled, let thermal, !thermal.ok {
+            } else if cooling.helperUnavailable {
                 Text(tr("Can't read fan data. The helper might be missing or doesn't have permission."))
                     .font(.callout)
                     .foregroundStyle(Brand.textHighlight.opacity(0.7))
-            } else if !pollingEnabled {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(tr("Fan monitoring is off by default so things stay quiet."))
-                        .font(.callout)
-                        .foregroundStyle(Brand.textHighlight)
-                    Text(tr("Turn it on in Settings → Cooling to see live fan speeds."))
-                        .font(.caption)
-                        .foregroundStyle(Brand.textHighlight.opacity(0.65))
-                }
             } else {
                 Text(tr("Waiting for fan data…"))
                     .font(.callout)
@@ -553,8 +605,12 @@ struct FanRing: View {
                         .font(.caption2)
                         .foregroundStyle(Brand.textHighlight.opacity(0.5))
                 }
-                if let minR = minRpm, let maxR = maxRpm {
+                if let minR = minRpm, let maxR = maxRpm, minR < maxR {
                     Text(tr("range %lld–%lld", minR, maxR))
+                        .font(.caption2)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.4))
+                } else if let maxR = maxRpm, maxR > 0 {
+                    Text(tr("max %@ rpm", Format.integer(maxR)))
                         .font(.caption2)
                         .foregroundStyle(Brand.textHighlight.opacity(0.4))
                 }

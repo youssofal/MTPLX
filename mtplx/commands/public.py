@@ -2990,6 +2990,8 @@ def cmd_stop_public(args: Any) -> int:
     """Stop a running MTPLX server via its health-reported pid."""
 
     from mtplx.daemon_client import (
+        PORT_AUTH_REQUIRED,
+        classify_port_occupant,
         probe_running_daemons,
         stop_daemon,
     )
@@ -3005,6 +3007,19 @@ def cmd_stop_public(args: Any) -> int:
             for line in lines:
                 print(line)
 
+    try:
+        resolved_key = resolve_api_key(
+            explicit_api_key=getattr(args, "api_key", None),
+            api_key_file=getattr(args, "api_key_file", None),
+        )
+    except (OSError, ValueError) as exc:
+        emit(
+            {"ok": False, "reason": "invalid_api_key", "error": str(exc)},
+            lines=[f"error: {exc}"],
+        )
+        return 2
+    api_key = resolved_key.value
+
     if port is None:
         # The app persists its (possibly port-preflight-bumped) port in
         # its settings; without this a bumped daemon is invisible to
@@ -3012,8 +3027,44 @@ def cmd_stop_public(args: Any) -> int:
         from mtplx.daemon_client import default_probe_ports
 
         probe_ports = default_probe_ports()
-        daemons = probe_running_daemons(host=host, ports=probe_ports)
+        daemons = probe_running_daemons(host=host, ports=probe_ports, api_key=api_key)
         if not daemons:
+            auth_ports = [
+                candidate
+                for candidate in probe_ports
+                if classify_port_occupant(host, candidate, api_key=api_key).kind
+                == PORT_AUTH_REQUIRED
+            ]
+            if auth_ports:
+                payload: dict[str, Any] = {
+                    "ok": False,
+                    "reason": "auth_required",
+                    "ports": auth_ports,
+                }
+                if len(auth_ports) == 1:
+                    payload["port"] = auth_ports[0]
+                port_label = (
+                    f"port {auth_ports[0]}"
+                    if len(auth_ports) == 1
+                    else "ports " + ", ".join(str(p) for p in auth_ports)
+                )
+                hint_port = f" --port {auth_ports[0]}" if len(auth_ports) == 1 else ""
+                auth_lines = (
+                    [
+                        f"Authentication failed for the MTPLX server on {port_label} "
+                        "(HTTP 401/403).",
+                        "Check --api-key-file, --api-key, or MTPLX_API_KEY.",
+                    ]
+                    if api_key
+                    else [
+                        f"The MTPLX server on {port_label} requires an API key.",
+                        "Pass --api-key-file <path> or --api-key <key> "
+                        "(or set MTPLX_API_KEY), e.g.: "
+                        f"mtplx stop{hint_port} --api-key-file <path>",
+                    ]
+                )
+                emit(payload, lines=auth_lines)
+                return 1
             emit(
                 {"ok": False, "reason": "no_server"},
                 lines=[
@@ -3043,7 +3094,7 @@ def cmd_stop_public(args: Any) -> int:
         port = daemons[0].port
 
     grace_s = float(getattr(args, "grace_seconds", 10.0))
-    result = stop_daemon(host, int(port), grace_s=grace_s)
+    result = stop_daemon(host, int(port), grace_s=grace_s, api_key=api_key)
     if result.get("ok"):
         emit(
             result,
@@ -3054,8 +3105,22 @@ def cmd_stop_public(args: Any) -> int:
         )
         return 0
     reason = str(result.get("reason") or "unknown")
+    auth_reason_lines = (
+        [
+            f"Authentication failed for the MTPLX server on port {port} "
+            "(HTTP 401/403).",
+            "Check --api-key-file, --api-key, or MTPLX_API_KEY.",
+        ]
+        if api_key
+        else [
+            f"The MTPLX server on port {port} requires an API key.",
+            f"Pass --api-key-file <path> or --api-key <key> (or set MTPLX_API_KEY): "
+            f"mtplx stop --port {port} --api-key-file <path>",
+        ]
+    )
     reason_lines = {
         "no_server": [f"No MTPLX server is listening on port {port}."],
+        "auth_required": auth_reason_lines,
         "not_mtplx": [
             f"Port {port} is in use, but not by an MTPLX server. Not touching it."
         ],
@@ -6414,10 +6479,19 @@ _FOLDER_REASON_TEXT = {
 def _folder_line(row: dict[str, Any]) -> str:
     from mtplx.ui import pretty_path
 
-    role = "downloads" if row.get("role") == "downloads" else "search   "
+    role_key = str(row.get("role") or "")
+    role = (
+        "downloads"
+        if role_key == "downloads"
+        else "hf cache "
+        if role_key == "huggingface_cache"
+        else "search   "
+    )
     if row.get("available"):
         packs = int(row.get("packs") or 0)
         state = f"{packs} pack{'s' if packs != 1 else ''}"
+        if role_key == "huggingface_cache":
+            state += ", read-only"
     else:
         state = _FOLDER_REASON_TEXT.get(str(row.get("reason")), str(row.get("reason")))
         if row.get("reason") == "not_connected":
@@ -6459,7 +6533,10 @@ def cmd_folders_public(args: Any) -> int:
     rows = model_folders.folders_report(
         change.get("model_dir"), search_dirs=change.get("model_dirs")
     )
+    hf_row = model_folders.hf_cache_folder_row()
     payload = {"action": action, **change, "folders": rows}
+    if hf_row is not None:
+        payload["huggingface_cache"] = hf_row
     if getattr(args, "json", False):
         _print(payload)
         return 0
@@ -6472,6 +6549,8 @@ def cmd_folders_public(args: Any) -> int:
     print(f"MTPLX model folders (shared with the app: {change.get('config_path')})")
     for row in rows:
         print(_folder_line(row))
+    if hf_row is not None:
+        print(_folder_line(hf_row))
     return 0
 
 

@@ -97,6 +97,20 @@ public enum StreamingMarkdownBlockSafety {
         )
     }
 
+    /// Slice overload for incremental suffix classification without
+    /// copying or re-scanning already-frozen prefix blocks.
+    public static func classifyRoles(
+        _ blocks: ArraySlice<StreamingDocumentBlock>,
+        startingInsideFence: Bool = false
+    ) -> Classification {
+        classifyRoles(
+            texts: blocks.lazy.map(\.text),
+            fences: blocks.lazy.map(\.fenceMarkerCount),
+            count: blocks.count,
+            startingInsideFence: startingInsideFence
+        )
+    }
+
     public static func classifyRoles(_ blockTexts: [String]) -> Classification {
         classifyRoles(
             texts: blockTexts.lazy.map { $0 },
@@ -108,14 +122,15 @@ public enum StreamingMarkdownBlockSafety {
     private static func classifyRoles<Texts: Sequence<String>, Fences: Sequence<Int>>(
         texts: Texts,
         fences fenceCounts: Fences,
-        count: Int
+        count: Int,
+        startingInsideFence: Bool = false
     ) -> Classification {
         guard count > 0 else {
             return Classification(settledSafe: [], fenceRoles: [])
         }
         var flags = [Bool](repeating: false, count: count)
         var roles = [FenceRole](repeating: .none, count: count)
-        var insideFence = false
+        var insideFence = startingInsideFence
         for (index, (text, fences)) in zip(texts, fenceCounts).enumerated() {
             let opensOrCloses = fences % 2 != 0
             let startsInsideFence = insideFence

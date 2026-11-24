@@ -908,7 +908,7 @@ def _cmd_probe(args: Any) -> int:
 
 
 def _cmd_discover(args: Any) -> int:
-    limit = max(1, min(100, int(getattr(args, "limit", 20) or 20)))
+    limit = max(1, min(500, int(getattr(args, "limit", 20) or 20)))
     offset = max(0, int(getattr(args, "offset", 0) or 0))
     query = str(getattr(args, "query", None) or "MTPLX")
     try:
@@ -940,6 +940,25 @@ def is_discoverable_repo(repo: str) -> bool:
     return "mtplx" in repo.rsplit("/", 1)[-1].lower()
 
 
+def _discover_query_tokens(query: str) -> list[str]:
+    return [tok for tok in re.split(r"\s+", query.strip().lower()) if tok]
+
+
+def _matches_discover_query(repo: str, query: str) -> bool:
+    tokens = _discover_query_tokens(query)
+    if not tokens:
+        return True
+    lower = repo.lower()
+    collapsed = re.sub(r"[-_./\s]+", "", lower)
+    for token in tokens:
+        if token in lower:
+            continue
+        collapsed_token = re.sub(r"[-_./\s]+", "", token)
+        if not collapsed_token or collapsed_token not in collapsed:
+            return False
+    return True
+
+
 def discover_models(*, query: str, limit: int, offset: int = 0) -> list[dict[str, Any]]:
     api = _make_hf_api()
     # Sorted by downloads descending; the name filter runs while we
@@ -949,8 +968,9 @@ def discover_models(*, query: str, limit: int, offset: int = 0) -> list[dict[str
     # below the slice — exactly the fresh, low-download models — could
     # never surface. huggingface_hub versions differ on offset support,
     # so offset still pages locally over the matching rows.
+    tokens = _discover_query_tokens(query)
     list_kwargs = {
-        "search": query or "MTPLX",
+        "search": "MTPLX" if len(tokens) > 1 else (query or "MTPLX"),
         "sort": "downloads",
         "direction": -1,
         "limit": _DISCOVER_SCAN_LIMIT,
@@ -971,7 +991,9 @@ def discover_models(*, query: str, limit: int, offset: int = 0) -> list[dict[str
             or getattr(model, "model_id", None)
             or ""
         )
-        if not is_discoverable_repo(repo):
+        if not is_discoverable_repo(repo) or (
+            len(tokens) > 1 and not _matches_discover_query(repo, query)
+        ):
             continue
         matched += 1
         if matched <= offset:

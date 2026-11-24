@@ -670,6 +670,7 @@ extension ChatRenderCaches {
     static func clearMemoryPressureSensitiveCaches() {
         clearSettledMarkdownBlocks()
         clearMarkdownDocuments()
+        StreamingProseMarkdownFormatter.clearCache()
     }
 
     static func clearSettledMarkdownBlocks() {
@@ -720,60 +721,90 @@ struct StreamingAssistantMarkdownView: View {
     var plainTextOnly: Bool = false
 
     var body: some View {
-        Group {
-            if plainTextOnly {
-                StreamingPlainDocumentView(
-                    document: document,
-                    fallbackText: fallbackText
-                )
-            } else {
-                StreamingRichDocumentView(
-                    document: document,
-                    fallbackText: fallbackText
-                )
-            }
-        }
+        StreamingRichDocumentView(
+            document: document,
+            fallbackText: fallbackText,
+            plainTextOnly: plainTextOnly
+        )
+        .id("\(ObjectIdentifier(document))-\(plainTextOnly)")
         .frame(maxWidth: .infinity, alignment: .leading)
         .transaction { tx in
             tx.animation = nil
         }
     }
 
+    /// Logical-line threshold for splitting frozen merged prose segments into
+    /// separate `StreamingProseTextSurface` chunks. Keeps each AppKit CALayer
+    /// compact (well under Metal texture limits) and bounds TextKit layout/draw
+    /// to O(1) while emitting at most ~1 SwiftUI item per 64 lines of prose.
+    static let proseChunkTargetLines = 64
+
+    struct DerivedRenderItem {
+        let item: StreamingRenderItem
+        /// Index in the source `blocks` collection immediately after the
+        /// blocks consumed to build `item`.
+        let blockEndIndex: Int
+        /// True when `item` is complete and immutable barring a reset or
+        /// segment merge (e.g. a finalized closed code card or a frozen
+        /// 64-line prose chunk / prose run closed by a finalized fence).
+        let canFreeze: Bool
+    }
+
     /// Groups blocks into render items using the classifier's fence
     /// roles. One linear pass per body evaluation; per-line highlight
     /// states are threaded through the cached lexer (dictionary hits
     /// for every already-frozen line, one real lex for a new line).
+    /// In Performance mode (`plainTextOnly`), fence classification and syntax
+    /// lexing are skipped so everything streams through bounded `.prose`
+    /// AppKit surfaces.
     @MainActor
     static func renderItems(
         for blocks: [StreamingDocumentBlock],
-        lexChain: StreamingFenceLexChain? = nil
+        lexChain: StreamingFenceLexChain? = nil,
+        plainTextOnly: Bool = false
     ) -> [StreamingRenderItem] {
         UIStreamPerfProbe.renderTimed(.renderItems, size: blocks.count) {
-            renderItemsBody(for: blocks, lexChain: lexChain)
+            deriveItems(
+                for: blocks[...],
+                lexChain: lexChain,
+                plainTextOnly: plainTextOnly
+            ).map(\.item)
         }
     }
 
-    private static func renderItemsBody(
-        for blocks: [StreamingDocumentBlock],
-        lexChain: StreamingFenceLexChain? = nil
-    ) -> [StreamingRenderItem] {
+    @MainActor
+    static func deriveItems(
+        for blocks: ArraySlice<StreamingDocumentBlock>,
+        lexChain: StreamingFenceLexChain? = nil,
+        plainTextOnly: Bool = false
+    ) -> [DerivedRenderItem] {
+        guard !blocks.isEmpty else { return [] }
+        if plainTextOnly {
+            var derived: [DerivedRenderItem] = []
+            derived.reserveCapacity(4)
+            appendProseRun(blocks, closedByFinalizedFence: false, into: &derived)
+            return derived
+        }
         // Consumes the fence counts stamped on the blocks at
         // construction — recounting text here was O(document) per frame.
         let classification = StreamingMarkdownBlockSafety.classifyRoles(blocks)
-        var items: [StreamingRenderItem] = []
-        items.reserveCapacity(blocks.count + 4)
-        var index = 0
-        while index < blocks.count {
-            switch classification.fenceRoles[index] {
+        let base = blocks.startIndex
+        let count = blocks.count
+        var derived: [DerivedRenderItem] = []
+        derived.reserveCapacity(8)
+        var offset = 0
+        while offset < count {
+            let blockIndex = base + offset
+            switch classification.fenceRoles[offset] {
             case .open(let label):
                 let language = MTPLXCodeHighlighter.Language.detect(fromFenceLabel: label)
                 var interior: [StreamingDocumentBlock] = []
                 var closed = false
-                var next = index + 1
-                scan: while next < blocks.count {
+                var next = offset + 1
+                scan: while next < count {
                     switch classification.fenceRoles[next] {
                     case .interior:
-                        interior.append(blocks[next])
+                        interior.append(blocks[base + next])
                         next += 1
                     case .close:
                         closed = true
@@ -783,11 +814,17 @@ struct StreamingAssistantMarkdownView: View {
                         break scan
                     }
                 }
+                let endIndex = base + next
                 if closed {
-                    items.append(.closedCode(
-                        id: blocks[index].id,
-                        language: language,
-                        code: interior.map(\.text).joined(separator: "\n")
+                    let closeBlockFinalized = blocks[endIndex - 1].finalized
+                    derived.append(DerivedRenderItem(
+                        item: .closedCode(
+                            id: blocks[blockIndex].id,
+                            language: language,
+                            code: interior.map(\.text).joined(separator: "\n")
+                        ),
+                        blockEndIndex: endIndex,
+                        canFreeze: closeBlockFinalized
                     ))
                 } else {
                     var fragments: [StreamingCodeFragment] = []
@@ -805,21 +842,21 @@ struct StreamingAssistantMarkdownView: View {
                     }
                     var state = MTPLXCodeHighlighter.LexState.none
                     var reusable = lexChain?.entries.count ?? 0
-                    for (offset, block) in interior.enumerated() {
+                    for (fragOffset, block) in interior.enumerated() {
                         fragments.append(StreamingCodeFragment(
                             block: block,
                             entryTag: state.cacheTag
                         ))
-                        if offset == interior.count - 1 { break }
+                        if fragOffset == interior.count - 1 { break }
                         let bytes = block.text.utf8.count
-                        if let lexChain, offset < reusable {
-                            let cached = lexChain.entries[offset]
+                        if let lexChain, fragOffset < reusable {
+                            let cached = lexChain.entries[fragOffset]
                             if cached.blockID == block.id, cached.textUTF8Count == bytes {
                                 state = cached.endState
                                 continue
                             }
-                            lexChain.entries.removeSubrange(offset...)
-                            reusable = offset
+                            lexChain.entries.removeSubrange(fragOffset...)
+                            reusable = fragOffset
                         }
                         if block.text.contains("\n") {
                             state = MTPLXCodeHighlighter
@@ -840,7 +877,7 @@ struct StreamingAssistantMarkdownView: View {
                         // still shows its chrome.
                         fragments.append(StreamingCodeFragment(
                             block: StreamingDocumentBlock(
-                                id: blocks[index].id &+ 1_000_000,
+                                id: blocks[blockIndex].id &+ 1_000_000,
                                 text: "",
                                 kind: .unfinished,
                                 finalized: false
@@ -848,26 +885,87 @@ struct StreamingAssistantMarkdownView: View {
                             entryTag: MTPLXCodeHighlighter.LexState.none.cacheTag
                         ))
                     }
-                    items.append(.openCode(
-                        id: blocks[index].id,
-                        language: language,
-                        fragments: fragments
+                    derived.append(DerivedRenderItem(
+                        item: .openCode(
+                            id: blocks[blockIndex].id,
+                            language: language,
+                            fragments: fragments
+                        ),
+                        blockEndIndex: endIndex,
+                        canFreeze: false
                     ))
                 }
-                index = next
+                offset = next
             case .none, .interior, .close, .mixed:
-                // Keep prose visually immutable while it streams. Promoting
-                // each completed line from plain Text to MarkdownUI changed
-                // its color, spacing, and height when the following line
-                // arrived — the visible "whole answer flickers every few
-                // lines" regression. The persisted bubble performs the one
-                // Markdown promotion after the response is complete; open
-                // fences still use the incremental highlighted card above.
-                items.append(.plain(blocks[index]))
-                index += 1
+                // Group contiguous non-code blocks into bounded `.prose`
+                // surfaces driven directly by `StreamingProseTextSurface`
+                // over `renderModel.perRevision`, avoiding per-line SwiftUI
+                // view accumulation and body churn at 120 Hz.
+                let runStart = offset
+                var next = offset + 1
+                while next < count {
+                    if case .open = classification.fenceRoles[next] {
+                        break
+                    }
+                    next += 1
+                }
+                let closedByFinalizedFence: Bool
+                if next < count, case .open = classification.fenceRoles[next] {
+                    closedByFinalizedFence = blocks[base + next].finalized
+                } else {
+                    closedByFinalizedFence = false
+                }
+                appendProseRun(
+                    blocks[(base + runStart)..<(base + next)],
+                    closedByFinalizedFence: closedByFinalizedFence,
+                    into: &derived
+                )
+                offset = next
             }
         }
-        return items
+        return derived
+    }
+
+    private static func appendProseRun(
+        _ run: ArraySlice<StreamingDocumentBlock>,
+        closedByFinalizedFence: Bool,
+        into derived: inout [DerivedRenderItem]
+    ) {
+        guard !run.isEmpty else { return }
+        var cursor = run.startIndex
+        let end = run.endIndex
+        var scan = cursor
+        var mergedLines = 0
+
+        // Split off leading permanent merged-segment chunks once they reach
+        // `proseChunkTargetLines`, leaving trailing single lines (and the
+        // growing tail) in one active prose surface.
+        while scan < end,
+              run[scan].finalized,
+              run[scan].text.contains("\n") {
+            mergedLines += run[scan].lineCount
+            scan += 1
+            if mergedLines >= proseChunkTargetLines, scan < end {
+                let chunk = Array(run[cursor..<scan])
+                derived.append(DerivedRenderItem(
+                    item: .prose(id: chunk[0].id, blocks: chunk),
+                    blockEndIndex: scan,
+                    canFreeze: true
+                ))
+                cursor = scan
+                mergedLines = 0
+            }
+        }
+
+        if cursor < end {
+            let remaining = Array(run[cursor..<end])
+            let allFinalized = closedByFinalizedFence && remaining.last?.finalized == true
+            derived.append(DerivedRenderItem(
+                item: .prose(id: remaining[0].id, blocks: remaining),
+                blockEndIndex: end,
+                canFreeze: allFinalized
+            ))
+        }
     }
 
     @MainActor
@@ -882,27 +980,6 @@ struct StreamingAssistantMarkdownView: View {
             }
         }
         return nil
-    }
-}
-
-/// Performance Lock deliberately retains the simple observed SwiftUI path.
-/// It has no syntax/TextKit work, so direct block publication is cheap and
-/// its semantics stay exactly as before.
-private struct StreamingPlainDocumentView: View {
-    @ObservedObject var document: StreamingDocumentStore
-    let fallbackText: String
-
-    var body: some View {
-        if document.blocks.isEmpty {
-            StreamingPlainTextView(text: fallbackText)
-        } else {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(document.blocks) { block in
-                    StreamingPlainBlockView(block: block)
-                        .equatable()
-                }
-            }
-        }
     }
 }
 
@@ -936,11 +1013,28 @@ final class StreamingRichRenderModel: ObservableObject {
     let perRevision = PassthroughSubject<[StreamingRenderItem], Never>()
 
     private let document: StreamingDocumentStore
+    let plainTextOnly: Bool
     private let lexChain = StreamingFenceLexChain()
     private var revisionCancellable: AnyCancellable?
 
-    init(document: StreamingDocumentStore) {
+    // Incremental frozen-prefix cache: between segment merges (99.7% of
+    // 120 Hz frames), earlier finalized code cards and 64-line prose chunks
+    // stay completely untouched — avoiding O(blocks) re-classification and
+    // closed-code string concatenation on every 8.3 ms tick.
+    private var frozenItems: [StreamingRenderItem] = []
+    private var frozenBlockCount = 0
+    private var frozenFirstBlockID = -1
+    private var frozenLastBlockID = -1
+    private var frozenLastBlockUTF8Count = -1
+    private var cachedMergeCount = -1
+
+    /// Total number of times `@Published items` published a new array
+    /// (also forwarded to `UIStreamPerfProbe.noteSwiftUIItemsPublished()`).
+    private(set) var itemsPublishCount = 0
+
+    init(document: StreamingDocumentStore, plainTextOnly: Bool = false) {
         self.document = document
+        self.plainTextOnly = plainTextOnly
         refresh(force: true)
         revisionCancellable = document.revisionPublisher.sink { [weak self] _ in
             self?.refresh()
@@ -948,10 +1042,45 @@ final class StreamingRichRenderModel: ObservableObject {
     }
 
     private func refresh(force: Bool = false) {
-        let next = StreamingAssistantMarkdownView.renderItems(
-            for: document.blocks,
-            lexChain: lexChain
-        )
+        let blocks = document.blocks
+        let mergeCount = document.liveSegmentMergeCount
+        let prefixValid = frozenBlockCount > 0
+            && cachedMergeCount == mergeCount
+            && blocks.count >= frozenBlockCount
+            && blocks[0].id == frozenFirstBlockID
+            && blocks[frozenBlockCount - 1].id == frozenLastBlockID
+            && blocks[frozenBlockCount - 1].text.utf8.count == frozenLastBlockUTF8Count
+
+        let next: [StreamingRenderItem]
+        if prefixValid {
+            let suffix = blocks[frozenBlockCount...]
+            let derivedSuffix = UIStreamPerfProbe.renderTimed(.renderItems, size: suffix.count) {
+                StreamingAssistantMarkdownView.deriveItems(
+                    for: suffix,
+                    lexChain: lexChain,
+                    plainTextOnly: plainTextOnly
+                )
+            }
+            var combined = frozenItems
+            combined.reserveCapacity(frozenItems.count + derivedSuffix.count)
+            for entry in derivedSuffix {
+                combined.append(entry.item)
+            }
+            advanceFrozenPrefix(from: derivedSuffix, in: blocks, mergeCount: mergeCount)
+            next = combined
+        } else {
+            resetFrozenPrefix()
+            let derivedAll = UIStreamPerfProbe.renderTimed(.renderItems, size: blocks.count) {
+                StreamingAssistantMarkdownView.deriveItems(
+                    for: blocks[...],
+                    lexChain: lexChain,
+                    plainTextOnly: plainTextOnly
+                )
+            }
+            advanceFrozenPrefix(from: derivedAll, in: blocks, mergeCount: mergeCount)
+            next = derivedAll.map(\.item)
+        }
+
         latestItems = next
         perRevision.send(next)
         let bucket = Self.openFenceLineBucket(for: next)
@@ -960,7 +1089,42 @@ final class StreamingRichRenderModel: ObservableObject {
         }
         if force || !Self.samePresentation(items, next) {
             items = next
+            if !force || !next.isEmpty {
+                itemsPublishCount += 1
+                UIStreamPerfProbe.noteSwiftUIItemsPublished()
+            }
         }
+    }
+
+    private func resetFrozenPrefix() {
+        frozenItems.removeAll(keepingCapacity: true)
+        frozenBlockCount = 0
+        frozenFirstBlockID = -1
+        frozenLastBlockID = -1
+        frozenLastBlockUTF8Count = -1
+        cachedMergeCount = -1
+    }
+
+    private func advanceFrozenPrefix(
+        from derived: [StreamingAssistantMarkdownView.DerivedRenderItem],
+        in blocks: [StreamingDocumentBlock],
+        mergeCount: Int
+    ) {
+        var advanced = false
+        for entry in derived {
+            guard entry.canFreeze else { break }
+            frozenItems.append(entry.item)
+            frozenBlockCount = entry.blockEndIndex
+            advanced = true
+            if case .closedCode = entry.item {
+                lexChain.reset(language: nil)
+            }
+        }
+        guard advanced, frozenBlockCount > 0, frozenBlockCount <= blocks.count else { return }
+        frozenFirstBlockID = blocks[0].id
+        frozenLastBlockID = blocks[frozenBlockCount - 1].id
+        frozenLastBlockUTF8Count = blocks[frozenBlockCount - 1].text.utf8.count
+        cachedMergeCount = mergeCount
     }
 
     /// Full slot = 420 pt; the card's height formula is lines * 17 + 22, so
@@ -984,6 +1148,11 @@ final class StreamingRichRenderModel: ObservableObject {
             case (.settled(let a), .settled(let b)),
                  (.plain(let a), .plain(let b)):
                 guard a == b else { return false }
+            case let (.prose(aID, _), .prose(bID, _)):
+                // Block growth is deliberately NOT compared: each prose
+                // surface listens to `perRevision` directly and only
+                // invalidates intrinsic size when wrapped height grows.
+                guard aID == bID else { return false }
             case let (.openCode(aID, aLanguage, _),
                       .openCode(bID, bLanguage, _)):
                 // Fragment growth is deliberately NOT compared: the live
@@ -1012,13 +1181,22 @@ final class StreamingRichRenderModel: ObservableObject {
 private struct StreamingRichDocumentView: View {
     let document: StreamingDocumentStore
     let fallbackText: String
+    let plainTextOnly: Bool
     @StateObject private var renderModel: StreamingRichRenderModel
 
-    init(document: StreamingDocumentStore, fallbackText: String) {
+    init(
+        document: StreamingDocumentStore,
+        fallbackText: String,
+        plainTextOnly: Bool = false
+    ) {
         self.document = document
         self.fallbackText = fallbackText
+        self.plainTextOnly = plainTextOnly
         _renderModel = StateObject(
-            wrappedValue: StreamingRichRenderModel(document: document)
+            wrappedValue: StreamingRichRenderModel(
+                document: document,
+                plainTextOnly: plainTextOnly
+            )
         )
     }
 
@@ -1046,6 +1224,13 @@ private struct StreamingRichDocumentView: View {
         case .plain(let block):
             StreamingPlainBlockView(block: block)
                 .equatable()
+        case .prose(let id, _):
+            StreamingProseChunkView(
+                id: id,
+                renderModel: renderModel,
+                plainTextOnly: plainTextOnly
+            )
+            .equatable()
         case .openCode(let id, let language, _):
             StreamingOpenCodeCardView(
                 id: id,
@@ -1062,9 +1247,29 @@ private struct StreamingRichDocumentView: View {
     }
 }
 
+private struct StreamingProseChunkView: View, Equatable {
+    let id: Int
+    let renderModel: StreamingRichRenderModel
+    let plainTextOnly: Bool
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.renderModel === rhs.renderModel && lhs.plainTextOnly == rhs.plainTextOnly
+    }
+
+    var body: some View {
+        StreamingProseTextSurface(
+            renderModel: renderModel,
+            proseID: id,
+            plainTextOnly: plainTextOnly
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 enum StreamingRenderItem: Identifiable {
     case settled(StreamingDocumentBlock)
     case plain(StreamingDocumentBlock)
+    case prose(id: Int, blocks: [StreamingDocumentBlock])
     case openCode(id: Int, language: MTPLXCodeHighlighter.Language, fragments: [StreamingCodeFragment])
     case closedCode(id: Int, language: MTPLXCodeHighlighter.Language, code: String)
 
@@ -1072,6 +1277,7 @@ enum StreamingRenderItem: Identifiable {
         switch self {
         case .settled(let block): return block.id
         case .plain(let block): return block.id
+        case .prose(let id, _): return id
         case .openCode(let id, _, _): return id
         case .closedCode(let id, _, _): return id
         }
@@ -1205,6 +1411,7 @@ struct StreamingCodeTextViewport: NSViewRepresentable {
             let text: String
             let entryTag: String
             let renderedUTF16Length: Int
+            let lineCount: Int
         }
 
         weak var surface: LiveTailTextSurface?
@@ -1374,7 +1581,8 @@ struct StreamingCodeTextViewport: NSViewRepresentable {
                 text: fragment.text,
                 entryTag: fragment.entryTag,
                 renderedUTF16Length: (hasSeparator ? 1 : 0)
-                    + (fragment.text.isEmpty ? 1 : fragment.text.utf16.count)
+                    + (fragment.text.isEmpty ? 1 : fragment.text.utf16.count),
+                lineCount: fragment.lineCount
             ))
         }
 
@@ -1424,19 +1632,14 @@ struct StreamingCodeTextViewport: NSViewRepresentable {
         storage: NSTextStorage,
         minimumLines: Int = 48
     ) {
-        func lineCount(_ text: String) -> Int {
-            text.utf8.reduce(into: 1) { count, byte in
-                if byte == 0x0A { count += 1 }
-            }
-        }
-        var totalLines = coordinator.applied.reduce(0) { $0 + lineCount($1.text) }
+        var totalLines = coordinator.applied.reduce(0) { $0 + $1.lineCount }
         var deleteUTF16 = 0
         while coordinator.applied.count > 1 {
             let head = coordinator.applied[0]
-            let headIsPermanentBoundary = head.text.contains("\n")
+            let headIsPermanentBoundary = head.lineCount > 1
                 || StreamingMarkdownBlockSafety.isFenceLine(head.text)
             guard headIsPermanentBoundary else { break }
-            let headLines = lineCount(head.text)
+            let headLines = head.lineCount
             guard totalLines - headLines >= minimumLines else { break }
             // The head's stored length excludes a separator; the separator
             // between it and the next fragment is stored in the NEXT
@@ -1449,7 +1652,8 @@ struct StreamingCodeTextViewport: NSViewRepresentable {
                 id: newHead.id,
                 text: newHead.text,
                 entryTag: newHead.entryTag,
-                renderedUTF16Length: newHead.renderedUTF16Length - 1
+                renderedUTF16Length: newHead.renderedUTF16Length - 1,
+                lineCount: newHead.lineCount
             )
             totalLines -= headLines
         }
@@ -1509,7 +1713,8 @@ struct StreamingCodeTextViewport: NSViewRepresentable {
                         id: current.id,
                         text: current.text,
                         entryTag: current.entryTag,
-                        renderedUTF16Length: mergedUTF16Length
+                        renderedUTF16Length: mergedUTF16Length,
+                        lineCount: current.lineCount
                     ))
                     oldIndex = scan + 1
                     newIndex += 1

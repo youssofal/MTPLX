@@ -4,6 +4,14 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.13.3] - 2026-11-24
+
+120 Hz streaming, 30 Hz Performance mode, faster Inkling 2 Mini code rewrites, M1/M2 long-prompt stability (#422), M5 Ultra Flash-Next speedup (#682), stepped Smart cooling, smaller-Mac memory headroom, app/settings fixes, Qwen 3.5 embeddings (#712), and local cache reuse. The full notes: [docs/releases/v2.13.3.md](docs/releases/v2.13.3.md).
+
+## [2.13.2] - 2026-11-23
+
+Fast-path Inkling 2 Mini top-p/top-k sampling, three-proposal default depth, parallel tool-call stream separation (#709), 24 GB memory headroom, and restored saved-session follow-ups (#710). The full notes: [docs/releases/v2.13.2.md](docs/releases/v2.13.2.md).
+
 ## [2.13.1] - 2026-11-22
 
 Inkling 2 Mini loads on M1 Macs (#706), and a source install builds MTPLX's engine with older

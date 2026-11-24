@@ -205,12 +205,14 @@ def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
     rt, row = _decode_runtime(pool_bytes=81 * mb)
     rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, 25)
     assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 81 * mb * 25 // 8
-    # The widest panel: the copy cap plus its anchor where wide panels are exact, else 8.
+    # The widest panel: aligned to warmed 8-row tiles where wide panels are exact, else 8.
     original = runtime_module.wide_rows_exact
     try:
         runtime_module.wide_rows_exact = lambda model, spec: True
-        assert widest_panel(None) == 25
+        assert runtime_module.wide_copy_widths(None) == (16, 24)
+        assert widest_panel(None) == 24
         runtime_module.wide_rows_exact = lambda model, spec: False
+        assert runtime_module.wide_copy_widths(None) == ()
         assert widest_panel(None) == 8
     finally:
         runtime_module.wide_rows_exact = original
@@ -619,3 +621,108 @@ def test_a_vision_tower_stored_below_its_source_precision_is_never_remapped(tmp_
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError):
         load_vision_weights(tmp_path)
+
+
+
+def test_prefill_window_bytes_skips_rings_when_leased():
+    rt = _catalog_runtime()
+    rings = InklingRuntime.ring_bytes(rt)
+    assert rings > 0
+
+    unleased = InklingRuntime.prefill_window_bytes(rt, 8192, 64)
+    leased = InklingRuntime.prefill_window_bytes(rt, 8192, 64, leased=True)
+    assert leased == max(0, unleased - rings)
+    assert InklingRuntime.prefill_window_bytes(rt, 8192, 0, leased=True) == 0
+
+
+def test_admission_geometry_and_growth_do_not_double_bill_leased_inkling_rings():
+    from mtplx.server.openai import _admission_geometry
+
+    rt = _catalog_runtime()
+    rings = InklingRuntime.ring_bytes(rt)
+    record = InklingRuntime.checkpoint_record_bytes(rt)
+
+    plan = SimpleNamespace(
+        runtime_transients_bytes=InklingRuntime.prefill_working_bytes(rt, 512, few=True, tight=True),
+        kv_bytes_per_token_effective=32768,
+        kv_bytes_per_token=32768,
+        aux_bytes_per_token=4096,
+        mtp_history_bytes_per_token=0,
+        prefill_transient_bytes_per_token=0,
+        attention_kv_copy_bytes_per_token=4096,
+        model_weights_bytes=15_993_374_536,
+        kv_quantization="off",
+    )
+    inkling_runtime = SimpleNamespace(
+        resident_kv_bytes_per_token=lambda: 32768,
+        prefill_kv_bytes_per_token=lambda: 32768,
+        window_cache_bytes=lambda *_a: InklingRuntime.window_cache_bytes(rt),
+        prefill_window_bytes=lambda p, m, w=None, *, leased=False: InklingRuntime.prefill_window_bytes(
+            rt, p, m, w, leased=leased
+        ),
+    )
+    geometry = _admission_geometry(SimpleNamespace(memory_plan=plan, runtime=inkling_runtime), 512)
+
+    warm_leased = _admission_growth(
+        geometry,
+        prompt_tokens=8192 + 128,
+        reused_tokens=8192,
+        restore_copies_prefix=False,
+        layout="contiguous_dense_decode",
+        source_layout="contiguous_dense_decode",
+        output_tokens=64,
+        publish=True,
+        scratch_bytes=plan.runtime_transients_bytes,
+        publish_bytes=record,
+    )
+    cold = _admission_growth(
+        geometry,
+        prompt_tokens=128,
+        reused_tokens=0,
+        restore_copies_prefix=False,
+        layout="contiguous_dense_decode",
+        source_layout=None,
+        output_tokens=64,
+        publish=True,
+        scratch_bytes=plan.runtime_transients_bytes,
+        publish_bytes=record,
+    )
+    restore_copy = _admission_growth(
+        geometry,
+        prompt_tokens=8192 + 128,
+        reused_tokens=8192,
+        restore_copies_prefix=True,
+        layout="contiguous_dense_decode",
+        source_layout="contiguous_dense_decode",
+        output_tokens=64,
+        publish=True,
+        scratch_bytes=plan.runtime_transients_bytes,
+        publish_bytes=record,
+        restore_fixed_bytes=InklingRuntime.window_cache_bytes(rt),
+    )
+
+    # A warm lease deducts ring_bytes() compared to unleased fixed windows on the same geometry.
+    assert geometry.prefill_windows(8320, 128) - geometry.prefill_windows(8320, 128, leased=True) == rings
+    assert warm_leased["live_prefill_bytes"] == cold["live_prefill_bytes"] - rings
+    assert restore_copy["live_prefill_bytes"] > warm_leased["live_prefill_bytes"] + rings
+
+    # Backwards-compatibility: 3-arg runtime hooks (without `leased`) keep working cleanly.
+    three_arg_runtime = SimpleNamespace(
+        resident_kv_bytes_per_token=lambda: 32768,
+        prefill_kv_bytes_per_token=lambda: 32768,
+        window_cache_bytes=lambda *_a: 123_456,
+        prefill_window_bytes=lambda p, m, w=None: 123_456 if m else 0,
+    )
+    three_arg_geom = _admission_geometry(SimpleNamespace(memory_plan=plan, runtime=three_arg_runtime), 512)
+    three_arg_warm = _admission_growth(
+        three_arg_geom,
+        prompt_tokens=8192 + 128,
+        reused_tokens=8192,
+        restore_copies_prefix=False,
+        layout="contiguous_dense_decode",
+        source_layout="contiguous_dense_decode",
+        output_tokens=64,
+        publish=False,
+        scratch_bytes=0,
+    )
+    assert three_arg_warm["live_prefill_bytes"] == 123_456 + 128 * 36864

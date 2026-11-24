@@ -326,4 +326,23 @@ final class StreamingDocumentSegmentCoalescingTests: XCTestCase {
         let expected = (0..<40).map { "line-\($0)" }.joined(separator: "\n")
         XCTAssertEqual(reassembled, expected)
     }
+
+    func testSliceClassifyRolesMatchesFullArrayClassification() {
+        let texts = [
+            "# Intro",
+            "```swift",
+            "let x = 1",
+            "```",
+            "After fence",
+            "```python",
+            "print(1)",
+        ]
+        let blocks = texts.enumerated().map { idx, text in
+            StreamingDocumentBlock(id: idx, text: text, kind: .plain, finalized: idx < texts.count - 1)
+        }
+        let full = StreamingMarkdownBlockSafety.classifyRoles(blocks)
+        let suffix = StreamingMarkdownBlockSafety.classifyRoles(blocks[4...], startingInsideFence: false)
+        XCTAssertEqual(suffix.fenceRoles, Array(full.fenceRoles[4...]))
+        XCTAssertEqual(suffix.settledSafe, Array(full.settledSafe[4...]))
+    }
 }

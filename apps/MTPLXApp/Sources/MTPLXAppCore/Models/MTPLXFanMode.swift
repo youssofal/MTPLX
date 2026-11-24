@@ -18,7 +18,7 @@ public enum MTPLXFanMode: String, CaseIterable, Codable, Equatable, Sendable {
         case .default:
             return tr("Apple's fan curve owns idle and generation.")
         case .smart:
-            return tr("Fans boost during generation, then return to auto.")
+            return tr("Fans stay quiet on short turns, ramp gently as heat builds, then return to auto.")
         case .max:
             return tr("Fans pin to verified max until you change mode or stop.")
         }

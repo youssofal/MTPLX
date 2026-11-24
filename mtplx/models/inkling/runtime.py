@@ -36,15 +36,24 @@ def make_weights_resident(model, drafter):
     mx.eval(model.parameters(), drafter.parameters() if drafter is not None else {})
 
 
-def widest_panel(model):
-    """The widest verify panel the fast step will be asked for: a copy round's block (the copy
-    lane's cap, 24 tokens by default) plus its anchor, up to ``MAX_PANEL``, where wide panels are
-    exact on this pack; else warm-up's widest."""
+def wide_copy_widths(model):
+    """Warmed 8-row-aligned wide copy verify widths for packs supporting wide panels."""
     if not wide_rows_exact(model, stage_spec()):
-        return engine_site.MAX_WARM_WIDTH
+        return ()
     from mtplx import context_copy
 
-    return max(engine_site.MAX_WARM_WIDTH, min(MAX_PANEL, context_copy.context_copy_block_k() + 1))
+    limit = min(MAX_PANEL, context_copy.context_copy_block_k() + 1)
+    snapped = (limit // engine_site.MAX_WARM_WIDTH) * engine_site.MAX_WARM_WIDTH
+    if snapped <= engine_site.MAX_WARM_WIDTH:
+        return ()
+    return tuple(range(engine_site.MAX_WARM_WIDTH * 2, snapped + 1, engine_site.MAX_WARM_WIDTH))
+
+
+def widest_panel(model):
+    """The widest verify panel the fast step will be asked for: aligned to warmed 8-row tiles where
+    wide panels are exact on this pack; else warm-up's widest."""
+    widths = wide_copy_widths(model)
+    return widths[-1] if widths else engine_site.MAX_WARM_WIDTH
 
 
 #: What a conversation past the first 4,096-row capacity step adds to the engine's pool beyond the
@@ -114,9 +123,10 @@ class InklingRuntime(MTPLXRuntime):
             # pool's largest temporaries inside the first capacity step, so the pool read below is
             # priced as measured plus what a longer conversation adds (``engine_pool_price``), not
             # scaled from warm-up's widest.
-            widest = widest_panel(model)
-            if widest > engine_site.MAX_WARM_WIDTH:
-                wide = engine_site.warm(self, widths=(widest,))
+            wide_widths = wide_copy_widths(model)
+            widest = wide_widths[-1] if wide_widths else engine_site.MAX_WARM_WIDTH
+            if wide_widths:
+                wide = engine_site.warm(self, widths=wide_widths)
                 self.engine_warm.setdefault("widths", {}).update(wide.get("widths") or {})
                 self.engine_warm["widest_seconds"] = wide.get("seconds")
             # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked
@@ -438,7 +448,7 @@ class InklingRuntime(MTPLXRuntime):
         tight = bool(getattr(plan, "tight_machine", False))
         return self.checkpoints_kept(few=True, tight=tight) * record + record // 2
 
-    def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None):
+    def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None, *, leased=False):
         if not new_tokens:
             return 0
         chunk = min(new_tokens, width or self.prompt_chunk_rows(prompt_tokens))
@@ -452,7 +462,12 @@ class InklingRuntime(MTPLXRuntime):
         # engine's pool at what it grows to: a short prompt's request holds that, not its
         # prompt-sized windows. What the pool and the load already hold is in MLX's active
         # memory, which the admission measures: only the rest is new (admission_fixed_bytes).
-        return max(prefill, self.admission_fixed_bytes())
+        total = max(prefill, self.admission_fixed_bytes())
+        if leased:
+            # A warm turn leasing the live cache continues with the sliding rings and conv
+            # tails already active in MLX; don't double-bill ``ring_bytes()`` against new growth.
+            return max(0, total - self.ring_bytes())
+        return total
 
     def embed_tokens(self, input_ids):
         return self.model.embed_tokens(input_ids)

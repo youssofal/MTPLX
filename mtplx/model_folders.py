@@ -20,7 +20,14 @@ from typing import Any
 
 from mtplx import toml_lines
 from mtplx.config import load_user_config, user_config_path
-from mtplx.hf_loader import model_cache_dir, model_library_roots
+from mtplx.hf_loader import (
+    _hf_home_env_set,
+    _hf_home_reuse_disabled,
+    _resolve_hf_dir_snapshot,
+    hf_hub_cache_dir,
+    model_cache_dir,
+    model_library_roots,
+)
 
 PACK_MARKERS = ("config.json", "mtplx_pair.json")
 
@@ -65,18 +72,40 @@ def folder_status(path: str | Path) -> dict[str, Any]:
     return row
 
 
+def _has_pack_marker(directory: Path) -> bool:
+    return any((directory / marker).is_file() for marker in PACK_MARKERS)
+
+
 def count_packs(root: str | Path) -> int:
     try:
         children = list(Path(str(root)).expanduser().iterdir())
     except OSError:
         return 0
-    return sum(
-        1
-        for child in children
-        if child.is_dir()
-        and not child.name.startswith(".")
-        and any((child / marker).is_file() for marker in PACK_MARKERS)
-    )
+    total = 0
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if child.name.startswith("models--"):
+            snap = _resolve_hf_dir_snapshot(child, require_complete=False)
+            if snap is not None and _has_pack_marker(snap):
+                total += 1
+        elif _has_pack_marker(child):
+            total += 1
+    return total
+
+
+def hf_cache_folder_row() -> dict[str, Any] | None:
+    """Read-only Hugging Face hub cache folder row when active or on disk."""
+    if _hf_home_reuse_disabled():
+        return None
+    hf_hub = hf_hub_cache_dir()
+    if not hf_hub.exists() and not _hf_home_env_set():
+        return None
+    status = folder_status(hf_hub)
+    status["role"] = "huggingface_cache"
+    status["read_only"] = True
+    status["packs"] = count_packs(hf_hub) if status["available"] else None
+    return status
 
 
 def folders_report(

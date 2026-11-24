@@ -331,7 +331,8 @@ def test_the_cost_gate_is_off_by_default_and_leaves_the_lane_alone(monkeypatch):
     monkeypatch.delenv("MTPLX_CONTEXT_COPY_GATE", raising=False)
     lane = PromptCopy(_rewrite_prompt(), session_id=None, verify_rows=32)
     assert lane.gate is None
-    assert lane.propose([1000, 1001], 100) == list(range(1002, 1010))
+    # Probation cap 8 snaps verify_rows 9 -> 8 (7 proposals + anchor) to stay on warmed tiles.
+    assert lane.propose([1000, 1001], 100) == list(range(1002, 1009))
     stats = lane.finish(2)
     assert "cost_gate" not in stats["context_copy_declines"]
     assert not any(k.startswith("gate_") for k in stats["context_copy_timing_s"])
@@ -374,3 +375,102 @@ def test_the_cost_gate_vetoes_copy_rounds_that_lose_and_keeps_those_that_pay(mon
     stats = paying.finish(100)
     assert stats["context_copy_timing_s"]["gate_ordinary_s"] == pytest.approx(0.05)
     assert stats["context_copy_timing_s"]["gate_copy_row_s"] == pytest.approx(0.004)
+
+
+def test_mixed_edit_boundary_matches_avoid_lockout_and_recover_width():
+    """In a rewrite with edit boundaries (e.g. 5..8 tokens landing out of a 23-token block)
+    interleaved with verbatim runs, profitable boundary hits (landed >= 4) must not trigger
+    a blind 64-token acceptance_backoff lockout, must step width down smoothly across 8-row
+    tiles when short boundaries repeat, and must jump back to full width once a block saturates."""
+    prompt = _rewrite_prompt()
+    lane = PromptCopy(prompt, session_id=None, verify_rows=32)
+    history = prompt[:16]  # ext=4 (full suffix match)
+
+    # Two saturated probation rounds unlock full width (23 proposals -> verify_rows=24).
+    for step in range(2):
+        offered = lane.propose(history, 200)
+        assert len(offered) == 7
+        lane.observe(len(offered), len(offered), 10 + 8 * step, 0.048)
+
+    wide_offer = lane.propose(history, 200)
+    assert len(wide_offer) == 23
+
+    # First edit boundary on a wide block: 6/23 landed (raw_share=0.26 < 0.35, but 6 verbatim tokens!).
+    # Must NOT suspend and steps smoothly from 24 -> 16 (15 proposals).
+    lane.observe(len(wide_offer), 6, 30, 0.095)
+    assert lane.suspensions == 0
+    mid_offer = lane.propose(history, 200)
+    assert mid_offer is not None and len(mid_offer) == 15
+
+    # Second consecutive boundary hit: 5/15 landed (still >= 4 verbatim tokens).
+    # Must NOT suspend and steps smoothly from 16 -> 8 (7 proposals).
+    lane.observe(len(mid_offer), 5, 36, 0.072)
+    assert lane.suspensions == 0
+    narrow_offer = lane.propose(history, 200)
+    assert narrow_offer is not None and len(narrow_offer) == 7
+
+    # Repeated 4..6-token boundary hits stay active at width 8 with zero lockouts.
+    for i, landed in enumerate((4, 5, 6, 4, 5)):
+        offer = lane.propose(history, 200)
+        assert offer is not None and len(offer) == 7
+        lane.observe(len(offer), landed, 44 + 7 * i, 0.048)
+    assert lane.suspensions == 0
+    assert "acceptance_backoff" not in lane.declines
+
+    # As soon as unchanged code resumes and a probation block saturates (7/7),
+    # full width (23 proposals) recovers immediately on the next round.
+    sat_offer = lane.propose(history, 200)
+    assert len(sat_offer) == 7
+    lane.observe(len(sat_offer), len(sat_offer), 90, 0.048)
+    recovered = lane.propose(history, 200)
+    assert recovered is not None and len(recovered) == 23
+    assert lane.finish(120)["context_copy_suspensions"] == 0
+
+
+def test_dead_matches_from_full_width_still_drop_and_suspend():
+    """Genuine dead/spurious matches (landed <= 1) must still drop immediately back to
+    probation width and trigger exponential suspension backoff once EMA falls below 0.35."""
+    prompt = _rewrite_prompt()
+    lane = PromptCopy(prompt, session_id=None, verify_rows=32)
+    history = prompt[:16]
+
+    # Unlock full width first.
+    for step in range(2):
+        offer = lane.propose(history, 200)
+        lane.observe(len(offer), len(offer), 10 + 8 * step, 0.048)
+    assert len(lane.propose(history, 200)) == 23
+
+    # First dead hit (landed=0) on a wide block drops width immediately back to probation (7).
+    lane.observe(23, 0, 30, 0.095)
+    after_miss = lane.propose(history, 200)
+    assert after_miss is not None and len(after_miss) == 7
+
+    # Continued dead/spurious hits (landed=0, 1) push EMA below 0.35 and suspend.
+    emitted = 32
+    for landed in (0, 1):
+        offer = lane.propose(history, 200)
+        assert offer is not None and len(offer) == 7
+        lane.observe(len(offer), landed, emitted, 0.048)
+        emitted += landed + 1
+
+    assert lane.suspensions == 1
+    assert lane.propose(history, 200) is None
+    assert lane.declines["acceptance_backoff"] == 1
+    assert lane.backoff == 128
+
+
+def test_dense_partial_edits_stay_at_probation_width_without_oscillating_or_locking_out():
+    """Repeated 5-token partial matches beat K3 at width 8 but would lose at width 24.
+    The lane must keep them active at width 8 without bouncing up to 24 or suspending."""
+    prompt = _rewrite_prompt()
+    lane = PromptCopy(prompt, session_id=None, verify_rows=32)
+    history = prompt[:16]
+    widths = []
+    for i in range(12):
+        offer = lane.propose(history, 200)
+        assert offer is not None
+        widths.append(len(offer) + 1)
+        lane.observe(len(offer), 5, 10 + 6 * i, 0.048)
+    assert widths == [8] * 12
+    assert lane.suspensions == 0
+    assert "acceptance_backoff" not in lane.declines

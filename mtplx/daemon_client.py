@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
@@ -79,14 +80,20 @@ def port_is_open(host: str, port: int, *, timeout: float = 0.2) -> bool:
         return False
 
 
-def fetch_daemon_health(
+@dataclass(frozen=True)
+class _HealthProbeResult:
+    daemon: RunningDaemon | None = None
+    auth_required: bool = False
+
+
+def _probe_daemon_health(
     host: str,
     port: int,
     *,
     timeout: float = 1.5,
     api_key: str | None = None,
-) -> RunningDaemon | None:
-    """Return the daemon behind ``host:port`` or ``None`` when it is not one."""
+) -> _HealthProbeResult:
+    """Query ``/health`` on ``host:port`` and preserve auth rejections."""
 
     url = f"http://{_connect_host(host)}:{int(port)}/health"
     headers: dict[str, str] = {}
@@ -96,6 +103,10 @@ def fetch_daemon_health(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        with suppress(Exception):
+            exc.close()
+        return _HealthProbeResult(auth_required=exc.code in (401, 403))
     except (
         urllib.error.URLError,
         TimeoutError,
@@ -103,25 +114,39 @@ def fetch_daemon_health(
         UnicodeDecodeError,
         OSError,
     ):
-        return None
+        return _HealthProbeResult()
     if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return None
+        return _HealthProbeResult()
     startup = payload.get("startup")
     startup = startup if isinstance(startup, dict) else {}
     launch_id = startup.get("launch_id")
     pid = startup.get("pid")
-    return RunningDaemon(
-        host=_connect_host(host),
-        port=int(port),
-        model=(str(payload.get("model")) if payload.get("model") else None),
-        model_path=(
-            str(payload.get("model_path")) if payload.get("model_path") else None
-        ),
-        launch_id=(str(launch_id) if launch_id else None),
-        pid=(int(pid) if isinstance(pid, int) else None),
-        api_key_required=bool(startup.get("api_key_required")),
-        health=payload,
+    return _HealthProbeResult(
+        daemon=RunningDaemon(
+            host=_connect_host(host),
+            port=int(port),
+            model=(str(payload.get("model")) if payload.get("model") else None),
+            model_path=(
+                str(payload.get("model_path")) if payload.get("model_path") else None
+            ),
+            launch_id=(str(launch_id) if launch_id else None),
+            pid=(int(pid) if isinstance(pid, int) else None),
+            api_key_required=bool(startup.get("api_key_required")),
+            health=payload,
+        )
     )
+
+
+def fetch_daemon_health(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 1.5,
+    api_key: str | None = None,
+) -> RunningDaemon | None:
+    """Return the daemon behind ``host:port`` or ``None`` when it is not one."""
+
+    return _probe_daemon_health(host, port, timeout=timeout, api_key=api_key).daemon
 
 
 def attach_probe_enabled() -> bool:
@@ -195,12 +220,13 @@ def detect_attachable_daemon(
 PORT_FREE = "free"
 PORT_APP_DAEMON = "app_daemon"
 PORT_MTPLX_SERVER = "mtplx_server"
+PORT_AUTH_REQUIRED = "auth_required"
 PORT_FOREIGN = "foreign"
 
 
 @dataclass(frozen=True)
 class PortOccupant:
-    kind: str  # free | app_daemon | mtplx_server | foreign
+    kind: str  # free | app_daemon | mtplx_server | auth_required | foreign
     daemon: RunningDaemon | None = None
 
 
@@ -216,12 +242,16 @@ def classify_port_occupant(
     ``app_daemon``: a healthy MTPLX server launched by the macOS app
     (``startup.launch_id`` present). ``mtplx_server``: a healthy MTPLX
     server without a launch id (an older CLI ``mtplx serve`` terminal).
+    ``auth_required``: a server on the port answered HTTP 401/403 to ``/health``.
     ``foreign``: something is listening but does not speak MTPLX health.
     """
 
     if not port_is_open(host, port):
         return PortOccupant(kind=PORT_FREE)
-    daemon = fetch_daemon_health(host, port, timeout=timeout, api_key=api_key)
+    probe = _probe_daemon_health(host, port, timeout=timeout, api_key=api_key)
+    if probe.auth_required:
+        return PortOccupant(kind=PORT_AUTH_REQUIRED)
+    daemon = probe.daemon
     if daemon is None:
         return PortOccupant(kind=PORT_FOREIGN)
     if daemon.owned_by_app:
@@ -429,6 +459,12 @@ def port_busy_advice(
             "Press Ctrl-C in that server's terminal, or run: "
             f"mtplx stop --port {port}",
         ]
+    if occupant.kind == PORT_AUTH_REQUIRED:
+        return [
+            f"Port {port} is a running MTPLX server that requires an API key.",
+            f"Stop it with: mtplx stop --port {port} --api-key-file <path> "
+            "(or --api-key <key>).",
+        ]
     if listener is not None and listener.owned_by_app:
         return [
             (
@@ -492,6 +528,8 @@ def stop_daemon(
     occupant = classify_port_occupant(host, port, timeout=timeout, api_key=api_key)
     if occupant.kind == PORT_FREE:
         return {"ok": False, "reason": "no_server", "port": int(port)}
+    if occupant.kind == PORT_AUTH_REQUIRED:
+        return {"ok": False, "reason": "auth_required", "port": int(port)}
     if occupant.kind == PORT_FOREIGN:
         return {"ok": False, "reason": "not_mtplx", "port": int(port)}
     daemon = occupant.daemon

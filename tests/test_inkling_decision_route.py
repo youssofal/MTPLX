@@ -51,10 +51,10 @@ def test_target_prefix_takes_the_host_and_client_controls_the_device(device_roun
     assert loop.decision_route(controlled) == (True, None)
 
 
-def test_wide_copy_decision_is_off_until_switched_on(monkeypatch):
-    # Copy panels past 8 rows stay host-decided by default (class B against the host's draw).
+def test_wide_copy_decision_is_on_by_default(monkeypatch):
+    # Copy panels past 8 rows use the GPU point-mass decision route by default; opt out via 0/off.
     monkeypatch.delenv("MTPLX_INKLING_WIDE_DECISION", raising=False)
-    assert not loop.fast_round.wide_decision_enabled()
+    assert loop.fast_round.wide_decision_enabled()
     for value, on in (("1", True), ("on", True), ("0", False), ("off", False)):
         monkeypatch.setenv("MTPLX_INKLING_WIDE_DECISION", value)
         assert loop.fast_round.wide_decision_enabled() is on

@@ -137,8 +137,12 @@ final class StreamingPerfRegressionTests: XCTestCase {
         // unbounded whole-drain WAS the "vomit" paste.
         let backlog = String(repeating: "x", count: 10_000)
         let (reveal, rest) = ChatViewModel.pacedCut(backlog, budget: 10_000)
-        XCTAssertLessThanOrEqual(reveal.count, 256,
-            "a stalled-then-recovered stream must catch up as fast typing, not one paste")
+        XCTAssertLessThanOrEqual(
+            reveal.count,
+            ChatViewModel.typewriterMaxRevealCharacters,
+            "a stalled-then-recovered stream must catch up as fast typing, not one paste"
+        )
+        XCTAssertLessThan(reveal.count, backlog.count / 10)
         XCTAssertEqual(reveal + rest, backlog, "no bytes may be lost or reordered")
     }
 
@@ -387,6 +391,230 @@ final class StreamingPerfRegressionTests: XCTestCase {
         let (reveal, rest) = ChatViewModel.pacedCut(String(repeating: "z", count: 110), budget: budget)
         XCTAssertEqual(reveal.count, 3)
         XCTAssertEqual(rest.count, 107)
+    }
+
+    @MainActor
+    func testDisplayLinkFrameRateRangeUsesNativeProMotionRefreshRate() {
+        let proMotion = ChatViewModel.preferredDisplayLinkFrameRateRange(maximumFramesPerSecond: 120)
+        XCTAssertEqual(proMotion.minimum, 60)
+        XCTAssertEqual(proMotion.maximum, 120)
+        XCTAssertEqual(proMotion.preferred, 120)
+
+        let standard = ChatViewModel.preferredDisplayLinkFrameRateRange(maximumFramesPerSecond: 60)
+        XCTAssertEqual(standard.minimum, 60)
+        XCTAssertEqual(standard.maximum, 60)
+        XCTAssertEqual(standard.preferred, 60)
+    }
+
+    @MainActor
+    func testDisplayLinkFrameRateRangeCapsAt30HzInPerformanceMode() {
+        let locked = ChatViewModel.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: 120,
+            performanceLock: true
+        )
+        XCTAssertEqual(locked.minimum, 15)
+        XCTAssertEqual(locked.maximum, 30)
+        XCTAssertEqual(locked.preferred, 30)
+
+        let unlocked = ChatViewModel.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: 120,
+            performanceLock: false
+        )
+        XCTAssertEqual(unlocked.minimum, 60)
+        XCTAssertEqual(unlocked.maximum, 120)
+        XCTAssertEqual(unlocked.preferred, 120)
+    }
+
+    @MainActor
+    func testPacer120HzHighTPSRampStaysLagBoundedAndSmooth() {
+        // Simulate a 120 Hz ProMotion display where generation starts at
+        // ~80 tok/s (~320 chars/s) for 0.6 s, then suddenly accelerates to
+        // ~350 tok/s (~1,400 chars/s, 14 chars every 10 ms) for 2.0 s.
+        // The old 1.2 s rate window + unbounded queue fell >500-1,500 ms
+        // behind the live TPS gauge on this ramp.
+        var pacer = StreamTypewriterPacer()
+        var buffer = ""
+        var fed = ""
+        var revealed = ""
+        let tickSeconds = 1.0 / 120.0
+
+        // Build arrival schedule: 0..0.6s at 320 chars/s, 0.6..2.6s at 1,400 chars/s.
+        var schedule: [(t: Double, count: Int)] = []
+        var t = 0.0
+        while t < 0.6 {
+            schedule.append((t, 8))
+            t += 0.025 // 320 chars/s
+        }
+        while t < 2.6 {
+            schedule.append((t, 14))
+            t += 0.010 // 1,400 chars/s (~350 tok/s)
+        }
+
+        var nextArrival = 0
+        var lagSamplesMs: [Double] = []
+        var maxSingleFrameReveal = 0
+        let totalTicks = Int((2.7 / tickSeconds).rounded(.up))
+        for tick in 0..<totalTicks {
+            let now = Double(tick) * tickSeconds
+            while nextArrival < schedule.count, schedule[nextArrival].t <= now + 1e-9 {
+                let item = schedule[nextArrival]
+                let chunk = String(repeating: "a", count: item.count)
+                buffer += chunk
+                fed += chunk
+                pacer.recordArrival(chars: item.count, now: item.t)
+                nextArrival += 1
+            }
+            if buffer.isEmpty {
+                pacer.noteIdleTick(now: now)
+                continue
+            }
+            let oldestBeforeCut = pacer.oldestBufferedArrivalUptime
+            let budget = pacer.tickBudget(backlog: buffer.count, now: now)
+            let cut = ChatViewModel.pacedCut(buffer, budget: budget)
+            revealed += cut.reveal
+            buffer = cut.rest
+            if buffer.isEmpty {
+                pacer.noteDrainedAll()
+            } else {
+                pacer.noteRevealed(chars: cut.reveal.count)
+            }
+            maxSingleFrameReveal = max(maxSingleFrameReveal, cut.reveal.count)
+            if let oldestBeforeCut, now >= 0.65, now <= 2.55 {
+                lagSamplesMs.append(max(0, (now - oldestBeforeCut) * 1000))
+            }
+        }
+        revealed += buffer
+
+        XCTAssertEqual(revealed, fed, "all bytes must be revealed in order")
+        XCTAssertFalse(lagSamplesMs.isEmpty)
+        let sortedLags = lagSamplesMs.sorted()
+        let p95LagMs = sortedLags[min(sortedLags.count - 1, Int(Double(sortedLags.count) * 0.95))]
+        let maxLagMs = sortedLags.last ?? 0
+        XCTAssertLessThanOrEqual(
+            p95LagMs, 180.0,
+            "120 Hz 350 tok/s p95 arrival-to-paint lag drifted to \(p95LagMs) ms"
+        )
+        XCTAssertLessThanOrEqual(
+            maxLagMs, 240.0,
+            "120 Hz 350 tok/s max lag (\(maxLagMs) ms) exceeded lag bound"
+        )
+        XCTAssertLessThan(
+            maxSingleFrameReveal, 60,
+            "high-TPS ramp must reveal smoothly frame-by-frame, not paste (\(maxSingleFrameReveal) chars)"
+        )
+    }
+
+    @MainActor
+    func testPacer120HzCopyLane350TokSBurstsStaySmoothAndLagBounded() {
+        // Context-copy lane at ~350 tok/s on 120 Hz: 140-char bursts landing
+        // every 100 ms (two 70-char SSE frames 3 ms apart).
+        var pacer = StreamTypewriterPacer()
+        var buffer = ""
+        var fed = ""
+        var revealed = ""
+        let tickSeconds = 1.0 / 120.0
+        var schedule: [(t: Double, count: Int)] = []
+        for round in 0..<25 {
+            let base = Double(round) * 0.10
+            schedule.append((base, 70))
+            schedule.append((base + 0.003, 70))
+        }
+
+        var nextArrival = 0
+        var warmReveals: [Int] = []
+        var warmLagsMs: [Double] = []
+        let totalTicks = Int((2.6 / tickSeconds).rounded(.up))
+        for tick in 0..<totalTicks {
+            let now = Double(tick) * tickSeconds
+            while nextArrival < schedule.count, schedule[nextArrival].t <= now + 1e-9 {
+                let item = schedule[nextArrival]
+                let chunk = String(repeating: "c", count: item.count)
+                buffer += chunk
+                fed += chunk
+                pacer.recordArrival(chars: item.count, now: item.t)
+                nextArrival += 1
+            }
+            if buffer.isEmpty {
+                pacer.noteIdleTick(now: now)
+                continue
+            }
+            let oldestBefore = pacer.oldestBufferedArrivalUptime
+            let budget = pacer.tickBudget(backlog: buffer.count, now: now)
+            let cut = ChatViewModel.pacedCut(buffer, budget: budget)
+            revealed += cut.reveal
+            buffer = cut.rest
+            if buffer.isEmpty {
+                pacer.noteDrainedAll()
+            } else {
+                pacer.noteRevealed(chars: cut.reveal.count)
+            }
+            if now >= 0.25, now <= 2.45 {
+                warmReveals.append(cut.reveal.count)
+                if let oldestBefore {
+                    warmLagsMs.append(max(0, (now - oldestBefore) * 1000))
+                }
+            }
+        }
+        revealed += buffer
+
+        XCTAssertEqual(revealed, fed)
+        XCTAssertFalse(warmReveals.isEmpty)
+        let maxReveal = warmReveals.max() ?? 0
+        XCTAssertLessThan(
+            maxReveal, 35,
+            "140-char copy block at 120 Hz must spread across ~12 frames, not paste (\(maxReveal) chars)"
+        )
+        let maxLag = warmLagsMs.max() ?? 0
+        XCTAssertLessThanOrEqual(
+            maxLag, 220.0,
+            "120 Hz copy-lane lag (\(maxLag) ms) exceeded bound"
+        )
+    }
+
+    func testPacerOldestBufferedArrivalUptimeTracksFifoOrder() {
+        var pacer = StreamTypewriterPacer()
+        XCTAssertNil(pacer.oldestBufferedArrivalUptime)
+        pacer.recordArrival(chars: 10, now: 1.0)
+        pacer.recordArrival(chars: 20, now: 1.05)
+        XCTAssertEqual(pacer.oldestBufferedArrivalUptime ?? -1, 1.0, accuracy: 1e-9)
+
+        pacer.noteRevealed(chars: 6)
+        XCTAssertEqual(pacer.oldestBufferedArrivalUptime ?? -1, 1.0, accuracy: 1e-9)
+
+        pacer.noteRevealed(chars: 4)
+        XCTAssertEqual(pacer.oldestBufferedArrivalUptime ?? -1, 1.05, accuracy: 1e-9)
+
+        pacer.noteDrainedAll()
+        XCTAssertNil(pacer.oldestBufferedArrivalUptime)
+    }
+
+    @MainActor
+    func testUIStreamPerfProbeAggregatesLagBacklogAndSwiftUIPublishes() {
+        let probe = UIStreamPerfProbe(environment: ["MTPLX_UI_PERF": "1"])
+        XCTAssertTrue(probe.enabled)
+        probe.turnStarted()
+        probe.flushApplied(
+            drainedBytes: 12, applyMs: 0.4, blocksAfter: 1,
+            backlogChars: 40, lagMs: 18.2
+        )
+        probe.flushApplied(
+            drainedBytes: 16, applyMs: 0.5, blocksAfter: 2,
+            backlogChars: 125, lagMs: 64.7
+        )
+        probe.flushApplied(
+            drainedBytes: 14, applyMs: 0.3, blocksAfter: 2,
+            backlogChars: 20, lagMs: 31.4
+        )
+        probe.swiftUIItemsPublished()
+        probe.swiftUIItemsPublished()
+        probe.turnEnded(requestId: "test-req-lag")
+
+        let summary = probe.lastTurnSummary
+        XCTAssertEqual(summary?.flushes, 3)
+        XCTAssertEqual(summary?.backlogCharsMax, 125)
+        XCTAssertEqual(summary?.swiftUIItemsPublishes, 2)
+        XCTAssertEqual(summary?.lagMsP50 ?? -1, 31.4, accuracy: 0.1)
+        XCTAssertEqual(summary?.lagMsMax ?? -1, 64.7, accuracy: 0.1)
     }
 
     // MARK: SSE line accumulator framing

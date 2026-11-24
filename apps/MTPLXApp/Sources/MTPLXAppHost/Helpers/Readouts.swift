@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import MTPLXAppCore
 
@@ -86,12 +87,32 @@ struct PrefillSpeedSummary: Equatable {
         throttledTurns = throttled
     }
 
-    /// "2 of 9 reads throttled" when heat slowed any of them, else the peak.
+    /// Compact tile caption: "1/4 throttled" when heat slowed any prefill
+    /// reads, else the peak read speed, else the count of qualifying reads.
     var caption: String? {
         if throttledTurns > 0 {
-            return tr("%@ of %@ reads throttled", Format.integer(throttledTurns), Format.integer(turns))
+            return tr("%@/%@ throttled", Format.integer(throttledTurns), Format.integer(turns))
         }
-        return peakTokS.map { tr("peak %@", Format.tps($0)) }
+        if let peakTokS {
+            return tr("peak %@", Format.tps(peakTokS))
+        }
+        return tr("%@ reads", Format.integer(turns))
+    }
+
+    /// Hover explanation naming qualifying prefill reads (2K+ new tokens) vs
+    /// total turns so compact tile captions stay unambiguous.
+    var helpText: String {
+        if throttledTurns > 0 {
+            return tr(
+                "%@ of %@ prefill reads (2K+ new tokens) ran while macOS slowed the GPU.",
+                Format.integer(throttledTurns),
+                Format.integer(turns)
+            )
+        }
+        return tr(
+            "Token-weighted average across %@ prefill reads (2K+ new tokens).",
+            Format.integer(turns)
+        )
     }
 }
 
@@ -177,6 +198,8 @@ struct TurnThinking: Equatable {
     /// Request arrival to the first answer text or tool call; nil when the
     /// turn sent none.
     var firstAnswerSeconds: Double?
+    /// Kind of first visible output (`"tool_call"`, `"text"`, or nil).
+    var firstVisibleKind: String?
 
     init?(_ row: MetricsLatest) {
         guard let reasoningEnd = row.reasoningS, reasoningEnd.isFinite, reasoningEnd >= 0 else { return nil }
@@ -185,15 +208,23 @@ struct TurnThinking: Equatable {
         seconds = reasoningEnd - firstToken
         tokens = row.reasoningTokens
         firstAnswerSeconds = row.firstVisibleS.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        firstVisibleKind = row.firstVisibleKind?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 
-    /// "thought for 34 s, 1,850 tokens · first answer at 35 s"
+    /// "thought for 34 s, 1,850 tokens · first answer at 35 s" (or
+    /// "first tool call at ..." when `first_visible_kind == "tool_call"`).
     var summary: String {
         var text = tokens.map {
             tr("thought for %@, %@ tokens", Self.seconds(seconds), Format.integer($0))
         } ?? tr("thought for %@", Self.seconds(seconds))
         if let first = firstAnswerSeconds {
-            text += " · " + tr("first answer at %@", Self.seconds(first))
+            if firstVisibleKind == "tool_call" {
+                text += " · " + tr("first tool call at %@", Self.seconds(first))
+            } else {
+                text += " · " + tr("first answer at %@", Self.seconds(first))
+            }
         }
         return text
     }
@@ -207,5 +238,512 @@ struct TurnThinking: Equatable {
             return tr("%@ s", value.formatted(.number.precision(.fractionLength(0))))
         }
         return Format.duration(value)
+    }
+}
+
+// MARK: - Dashboard layout
+
+/// Shared clearance for the floating `^ Expand chat` handle when the daemon is
+/// running in dashboard mode, so bottom cards in every tab scroll completely
+/// clear of the pill.
+enum DashboardLayout {
+    static let expandChatBottomClearance: CGFloat = 72
+
+    static func scrollBottomPadding(daemonRunning: Bool) -> CGFloat {
+        daemonRunning ? 76 : 20
+    }
+}
+
+// MARK: - Decode chart & hero truthfulness
+
+/// Single completed-turn series powering `DecodeChart`, the `5-min Min/Max`
+/// tile, and `ALL-TIME MAX` on the hero gauge. Keeping all three on the same
+/// completed-turn series prevents mid-turn instantaneous spikes from plotting
+/// above `ALL-TIME MAX` or contradicting the 5-minute window statistics.
+struct DecodeChartSummary: Equatable {
+    static let defaultMaxRenderedPoints = 240
+
+    let points: [Double]
+    let sampleCount: Int
+    let min: Double?
+    let max: Double?
+    let mean: Double?
+    let allTimeMax: Double
+
+    init(rolling: RollingMetrics?, maxRenderedPoints: Int = Self.defaultMaxRenderedPoints) {
+        guard let rolling else {
+            self.points = []
+            self.sampleCount = 0
+            self.min = nil
+            self.max = nil
+            self.mean = nil
+            self.allTimeMax = 0
+            return
+        }
+        let completed = rolling.history
+            .map(\.tokS)
+            .filter { $0.isFinite && $0 >= 0 }
+        let rendered = Self.downsamplePreservingPeak(completed, maxCount: maxRenderedPoints)
+        let seriesPeak = completed.max()
+        let seriesMin = completed.min()
+        let resolvedMax: Double? = {
+            switch (rolling.max, seriesPeak) {
+            case let (a?, b?): return Swift.max(a, b)
+            case let (a?, nil): return a
+            case let (nil, b?): return b
+            case (nil, nil): return nil
+            }
+        }()
+        let resolvedMin: Double? = {
+            switch (rolling.min, seriesMin) {
+            case let (a?, b?): return Swift.min(a, b)
+            case let (a?, nil): return a
+            case let (nil, b?): return b
+            case (nil, nil): return nil
+            }
+        }()
+        let resolvedMean: Double? = {
+            if let mean = rolling.mean, mean.isFinite { return mean }
+            guard !completed.isEmpty else { return nil }
+            return completed.reduce(0, +) / Double(completed.count)
+        }()
+        let sticky = rolling.stickyAllTimeMax.isFinite ? Swift.max(0, rolling.stickyAllTimeMax) : 0
+        self.points = rendered
+        self.sampleCount = completed.count
+        self.min = resolvedMin
+        self.max = resolvedMax
+        self.mean = resolvedMean
+        self.allTimeMax = Swift.max(sticky, resolvedMax ?? 0)
+    }
+
+    private static func downsamplePreservingPeak(_ points: [Double], maxCount: Int) -> [Double] {
+        guard maxCount > 1, points.count > maxCount else { return points }
+        let stride = Double(points.count - 1) / Double(maxCount - 1)
+        var result = (0..<maxCount).map { idx in
+            points[Swift.min(points.count - 1, Int((Double(idx) * stride).rounded()))]
+        }
+        if let peakIdx = points.indices.max(by: { points[$0] < points[$1] }) {
+            let mapped = Swift.min(
+                maxCount - 1,
+                Swift.max(0, Int((Double(peakIdx) / stride).rounded()))
+            )
+            result[mapped] = points[peakIdx]
+        }
+        return result
+    }
+}
+
+/// Clarifies what the hero gauge is displaying (live decode vs finished last
+/// turn held at rest alongside the 5-minute average) and exposes the
+/// consistent `ALL-TIME MAX` value.
+struct HeroDecodeCaption: Equatable {
+    let statusSubtitle: String?
+    let allTimeMax: Double?
+
+    init(
+        headlineDecode: HeadlineDecodeReading,
+        isLiveDecode: Bool,
+        hasRealRequest: Bool,
+        rolling: RollingMetrics?
+    ) {
+        let summary = DecodeChartSummary(rolling: hasRealRequest ? rolling : nil)
+        let avg = summary.mean.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+
+        if isLiveDecode {
+            if let avg {
+                self.statusSubtitle = tr("live · 5-min avg %@ TPS", Format.tps(avg))
+            } else {
+                self.statusSubtitle = tr("live decode")
+            }
+        } else if hasRealRequest, headlineDecode.value != nil {
+            if let avg {
+                self.statusSubtitle = tr("last turn · 5-min avg %@ TPS", Format.tps(avg))
+            } else {
+                self.statusSubtitle = tr("last turn")
+            }
+        } else {
+            self.statusSubtitle = nil
+        }
+
+        if hasRealRequest, summary.allTimeMax > 0 {
+            self.allTimeMax = summary.allTimeMax
+        } else {
+            self.allTimeMax = nil
+        }
+    }
+}
+
+// MARK: - Cached tile readout
+
+/// Compact, truthful readout for the `CACHED` tile on LiveTab. Keeps current
+/// prompt cached tokens strictly distinct from lifetime cached tokens and
+/// formats large totals compactly (`2.57M total`) so the caption never
+/// truncates with an ellipsis.
+struct CachedTileReadout: Equatable {
+    let value: String
+    let unit: String?
+    let caption: String?
+    let isLifetimeFallback: Bool
+
+    static func formatCompactTokens(_ value: Int?) -> String {
+        guard let value, value >= 0 else { return "—" }
+        let locale = L10n.language.locale
+        if value < 1_000 { return String(value) }
+        if value < 9_950 {
+            return String(format: "%.1fK", locale: locale, Double(value) / 1_000.0)
+        }
+        if value < 999_500 {
+            return String(format: "%.0fK", locale: locale, Double(value) / 1_000.0)
+        }
+        if value < 9_995_000 {
+            return String(format: "%.2fM", locale: locale, Double(value) / 1_000_000.0)
+        }
+        if value < 99_950_000 {
+            return String(format: "%.1fM", locale: locale, Double(value) / 1_000_000.0)
+        }
+        if value < 999_500_000 {
+            return String(format: "%.0fM", locale: locale, Double(value) / 1_000_000.0)
+        }
+        return String(format: "%.2fB", locale: locale, Double(value) / 1_000_000_000.0)
+    }
+
+    init(
+        smoothed: SmoothedMetrics,
+        latest: MetricsLatest?,
+        lifetime: LifetimeSnapshot?,
+        sessionBank: SessionBank?
+    ) {
+        let lifetimeTotal = lifetime.flatMap { $0.cachedTokensTotal > 0 ? $0.cachedTokensTotal : nil }
+        let currentCached: Int? = {
+            if let s = smoothed.cachedTokens, s >= 0.5 {
+                return Int(s.rounded())
+            }
+            if let c = latest?.cachedTokens, c > 0 {
+                return c
+            }
+            if latest?.sessionCacheHit != false,
+               let b = sessionBank?.lastEffectiveCachedTokens,
+               b > 0 {
+                return b
+            }
+            return nil
+        }()
+
+        if let current = currentCached {
+            self.value = Format.integer(current)
+            self.unit = "tok"
+            self.isLifetimeFallback = false
+            if latest?.sessionCacheHit == true {
+                if let total = lifetimeTotal {
+                    self.caption = tr("hit · %@ total", Self.formatCompactTokens(total))
+                } else {
+                    self.caption = tr("hit")
+                }
+            } else if sessionBank?.hasEffectiveCacheHit == true {
+                let source = sessionBank?.lastEffectiveCacheSource ?? "cache"
+                if let total = lifetimeTotal {
+                    self.caption = tr("%@ · %@ total", source, Self.formatCompactTokens(total))
+                } else {
+                    self.caption = tr("%@ hit", source)
+                }
+            } else if let total = lifetimeTotal {
+                self.caption = tr("%@ total", Self.formatCompactTokens(total))
+            } else {
+                self.caption = nil
+            }
+        } else if latest?.sessionCacheHit == false || latest?.cachedTokens == 0 {
+            self.value = "0"
+            self.unit = "tok"
+            self.isLifetimeFallback = false
+            if let total = lifetimeTotal {
+                self.caption = tr("miss · %@ total", Self.formatCompactTokens(total))
+            } else {
+                self.caption = tr("miss")
+            }
+        } else if let total = lifetimeTotal {
+            self.value = Self.formatCompactTokens(total)
+            self.unit = "tok"
+            self.isLifetimeFallback = true
+            self.caption = tr("lifetime total")
+        } else {
+            self.value = "—"
+            self.unit = "tok"
+            self.isLifetimeFallback = false
+            self.caption = nil
+        }
+    }
+}
+
+// MARK: - Verify waterfall summary
+
+/// Breakdown of speculative draft + verify wall time for `VerifyWaterfallExpander`.
+/// Supports Qwen MTP sub-phase receipts, Gemma 4 assistant receipts, and
+/// Inkling K3 receipts (`draft_time_s`, `verify_forward_time_s`, `verify_time_s`).
+struct VerifyWaterfallSummary: Equatable {
+    struct Segment: Equatable {
+        let key: String
+        let label: String
+        let seconds: Double
+    }
+
+    let segments: [Segment]
+    let totalSeconds: Double
+    let draftSeconds: Double?
+    let verifySeconds: Double?
+    let verifyForwardSeconds: Double?
+    let verifyCalls: Int?
+
+    var msPerCallSeconds: Double? {
+        guard let calls = verifyCalls, calls > 0, let verify = verifySeconds, verify > 0 else {
+            return nil
+        }
+        return verify / Double(calls)
+    }
+
+    init(latest: MetricsLatest?) {
+        func positive(_ value: Double?) -> Double? {
+            guard let value, value.isFinite, value > 0 else { return nil }
+            return value
+        }
+
+        let draft = positive(latest?.draftTimeS)
+        let verify = positive(latest?.verifyTimeS)
+        let verifyForward = positive(latest?.verifyForwardTimeS)
+        let targetDist = positive(latest?.verifyTargetDistTimeS ?? latest?.verifyLogitsEvalTimeS)
+        let verifyHidden = positive(latest?.verifyHiddenEvalTimeS)
+        let verifyOther = positive(latest?.verifyEvalUnattributedS)
+
+        self.draftSeconds = draft
+        self.verifySeconds = verify
+        self.verifyForwardSeconds = verifyForward
+        self.verifyCalls = latest?.verifyCalls.flatMap { $0 > 0 ? $0 : nil }
+
+        var built: [Segment] = []
+        if let draft {
+            built.append(Segment(key: "draft", label: "draft", seconds: draft))
+        }
+
+        let hasDetailedSubphases = targetDist != nil || verifyHidden != nil || verifyOther != nil
+        if hasDetailedSubphases {
+            if let vf = verifyForward {
+                built.append(Segment(key: "verify_forward", label: "verify_forward", seconds: vf))
+            }
+            if let td = targetDist {
+                built.append(Segment(key: "target_dist", label: "target_dist", seconds: td))
+            }
+            if let vh = verifyHidden {
+                built.append(Segment(key: "verify_hidden", label: "verify_hidden", seconds: vh))
+            }
+            if let vo = verifyOther {
+                built.append(Segment(key: "verify_other", label: "verify_other", seconds: vo))
+            }
+            let subSum = (verifyForward ?? 0) + (targetDist ?? 0) + (verifyHidden ?? 0) + (verifyOther ?? 0)
+            if let verify, verifyOther == nil {
+                let overhead = verify - subSum
+                if overhead >= 0.0005 {
+                    built.append(Segment(key: "verify_overhead", label: "verify_overhead", seconds: overhead))
+                }
+            }
+        } else if let vf = verifyForward {
+            if let verify {
+                let forwardPart = min(vf, verify)
+                built.append(Segment(key: "verify_forward", label: "verify_forward", seconds: forwardPart))
+                let overhead = verify - forwardPart
+                if overhead >= 0.0005 {
+                    built.append(Segment(key: "verify_overhead", label: "verify_overhead", seconds: overhead))
+                }
+            } else {
+                built.append(Segment(key: "verify_forward", label: "verify_forward", seconds: vf))
+            }
+        } else if let verify {
+            built.append(Segment(key: "verify", label: "verify", seconds: verify))
+        }
+
+        self.segments = built
+        self.totalSeconds = built.reduce(0) { $0 + $1.seconds }
+    }
+
+    var footerSummary: String? {
+        switch (draftSeconds, verifySeconds) {
+        case let (d?, v?):
+            return tr("Draft %@ · Verify %@", Format.duration(d), Format.duration(v))
+        case let (nil, v?):
+            return tr("Verify: %@", Format.duration(v))
+        case let (d?, nil):
+            return tr("Draft: %@", Format.duration(d))
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    static func emptyStateMessage(daemonState: DaemonStateKind) -> String {
+        if daemonState == .running {
+            return tr("Collecting timing on next turn.")
+        }
+        return tr("Detailed timing will show here once a model is running.")
+    }
+}
+
+// MARK: - System cooling readout
+
+/// Active fan mode, live RPMs, and macOS SoC thermal state for `SystemTab`.
+/// Surfaces real active fan mode and live fan RPMs whenever thermal status is
+/// available, even while background Thermal Polling is switched off.
+struct SystemCoolingReadout: Equatable {
+    let activeFanMode: MTPLXFanMode
+    let snapshot: ThermalSnapshot?
+    let pollingEnabled: Bool
+    let helperUnavailable: Bool
+    let thermalPressureLevel: String?
+
+    var hasLiveFans: Bool {
+        snapshot?.ok == true && !(snapshot?.fans.isEmpty ?? true)
+    }
+
+    var isThrottling: Bool {
+        ThermalPressureNotice.isThrottling(thermalPressureLevel)
+    }
+
+    var thermalStateLabel: String? {
+        switch thermalPressureLevel?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "nominal": return tr("Nominal")
+        case "moderate": return tr("Moderate")
+        case "heavy": return tr("Heavy (throttling)")
+        case "trapping": return tr("Trapping (throttling)")
+        case "sleeping": return tr("Critical (throttling)")
+        default: return nil
+        }
+    }
+
+    var coolingBadgeText: String {
+        tr("Fans: %@", activeFanMode.title)
+    }
+
+    var pollingBadgeText: String {
+        pollingEnabled ? tr("Background polling on") : tr("Live while System is open")
+    }
+
+    init(
+        pollingEnabled: Bool,
+        thermal: ThermalSnapshot?,
+        thermalStatus: DynamicObject?,
+        health: HealthPayload?,
+        currentFanMode: String?,
+        configuredFanMode: String
+    ) {
+        self.pollingEnabled = pollingEnabled
+
+        let rawMode = [
+            thermalStatus?.string("current_mode"),
+            currentFanMode,
+            health?.fanMode,
+            configuredFanMode,
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
+        self.activeFanMode = MTPLXFanMode.normalized(rawMode)
+
+        let statusSummary = ThermalSnapshot.from(fanSummary: thermalStatus?.object("fan_summary"))
+        let healthSummary = ThermalSnapshot.from(fanSummary: health?.thermal?.fanSummary?.values)
+        let candidates: [ThermalSnapshot?] = pollingEnabled
+            ? [thermal, statusSummary, healthSummary]
+            : [statusSummary, thermal, healthSummary]
+
+        let live = candidates.compactMap { $0 }.first { $0.ok && !$0.fans.isEmpty }
+        let resolved = live ?? candidates.compactMap { $0 }.first
+        self.snapshot = resolved
+
+        let statusExplicitlyFailed = thermalStatus?.bool("ok") == false
+            && (thermalStatus?.object("detection")?["available"]?.boolValue != true)
+        self.helperUnavailable = live == nil && (resolved?.ok == false || statusExplicitlyFailed)
+        self.thermalPressureLevel = health?.thermalPressure?.level
+    }
+}
+
+// MARK: - Activity truthfulness readouts
+
+enum AgentLaneReadout {
+    static func resolvedEffort(
+        latest: MetricsLatest?,
+        snapshotResolvedEffort: String? = nil,
+        snapshotSettingsEffort: String? = nil
+    ) -> String? {
+        if let perRequest = latest?.resolvedReasoningEffort, !perRequest.isEmpty {
+            return perRequest
+        }
+        guard latest?.requestEnableThinking != false,
+              latest?.requestReasoningMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "off"
+        else { return nil }
+        for candidate in [snapshotResolvedEffort, snapshotSettingsEffort] {
+            if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return nil
+    }
+
+    static func text(
+        latest: MetricsLatest?,
+        snapshotResolvedEffort: String? = nil,
+        snapshotSettingsEffort: String? = nil
+    ) -> String {
+        guard let latest else { return tr("No agent lane data yet.") }
+        var parts: [String] = []
+        if let client = latest.requestClientHint, !client.isEmpty {
+            parts.append(client)
+        }
+        if let mode = latest.requestGenerationMode, !mode.isEmpty {
+            parts.append(mode.uppercased())
+        }
+        if let depth = latest.requestEffectiveMtpDepth
+            ?? latest.requestDepth
+            ?? latest.mtpDepth
+            ?? latest.speculativeDepth {
+            parts.append(tr("depth %lld", depth))
+        }
+        if let reasoning = latest.requestReasoningMode, !reasoning.isEmpty {
+            parts.append(tr("reasoning %@", reasoning))
+        } else if let thinking = latest.requestEnableThinking {
+            parts.append(thinking ? tr("thinking on") : tr("thinking off"))
+        }
+        if let effort = resolvedEffort(
+            latest: latest,
+            snapshotResolvedEffort: snapshotResolvedEffort,
+            snapshotSettingsEffort: snapshotSettingsEffort
+        ) {
+            parts.append(tr("effort %@", effort))
+        }
+        if let filteredCount = latest.requestFilteredToolCount {
+            parts.append(tr("%@ active tools", Format.integer(filteredCount)))
+        } else if let filtered = latest.requestFilteredToolNames {
+            parts.append(tr("%@ active tools", Format.integer(filtered.count)))
+        } else if let tools = latest.requestToolNames {
+            parts.append(tr("%lld tools", tools.count))
+        } else if let toolCount = latest.requestToolCount {
+            parts.append(tr("%@ tools", Format.integer(toolCount)))
+        }
+        if let hidden = latest.requestHiddenToolNames, !hidden.isEmpty {
+            parts.append(tr("%lld hidden", hidden.count))
+        }
+        return parts.isEmpty ? tr("No agent lane data yet.") : parts.joined(separator: " · ")
+    }
+}
+
+/// Resolves real RAM bytes and cumulative hit counts across `SessionRow` and
+/// `SessionBank` so live-reference leases (`held_nbytes`) never show as 0 KB.
+enum SessionBytesReadout {
+    static func bytes(for session: SessionRow, sessionBank: SessionBank?) -> Int {
+        let bankBytes = sessionBank?.prefixes?
+            .filter { $0.sessionId == session.sessionId }
+            .reduce(0) { $0 + max(0, $1.effectiveNbytes) } ?? 0
+        return max(session.effectiveBytes, bankBytes)
+    }
+
+    static func hits(for session: SessionRow, sessionBank: SessionBank?) -> Int {
+        let bankHits = sessionBank?.prefixes?
+            .filter { $0.sessionId == session.sessionId }
+            .reduce(0) { $0 + max(0, $1.effectiveHits) } ?? 0
+        return max(session.effectiveHits ?? 0, bankHits)
     }
 }

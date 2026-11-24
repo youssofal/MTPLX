@@ -120,9 +120,13 @@ def test_a_lease_counts_toward_the_bank_total_and_shows_in_health():
     health = bank.to_dict()
     assert health["lease_entries"] == 1
     assert health["lease_nbytes"] == bank.total_nbytes
+    assert health["held_nbytes"] == bank.total_nbytes
     assert health["prefixes"][0]["held_nbytes"] == bank.total_nbytes
-    # The snapshot-byte field keeps its meaning: a lease has no snapshot.
-    assert health["prefixes"][0]["nbytes"] == 0
+    # Live-reference leases report their true held RAM footprint on ``nbytes``
+    # so dashboard/app surfaces never render them as Zero KB, while keeping the
+    # snapshot-only byte count visible under ``snapshot_nbytes``.
+    assert health["prefixes"][0]["nbytes"] == bank.total_nbytes
+    assert health["prefixes"][0]["snapshot_nbytes"] == 0
 
 
 def test_the_refused_snapshot_size_is_the_floor_when_the_cache_cannot_report_bytes():

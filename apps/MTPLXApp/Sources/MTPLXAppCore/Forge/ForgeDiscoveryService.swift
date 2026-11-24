@@ -2,6 +2,40 @@ import Foundation
 
 // MARK: - DiscoveryEntry
 
+public extension DiscoveryEntry {
+    /// Multi-token, separator-insensitive match against branded name, owner, and repo ID.
+    func matchesSearchQuery(_ query: String) -> Bool {
+        let tokens = query
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+        guard !tokens.isEmpty else { return true }
+        let haystacks = [
+            brandedName.lowercased(),
+            owner.lowercased(),
+            repo.lowercased(),
+        ]
+        let collapsedHaystacks = haystacks.map {
+            $0.components(separatedBy: CharacterSet(charactersIn: "-_./ ")).joined()
+        }
+        for rawToken in tokens {
+            let token = String(rawToken)
+            if haystacks.contains(where: { $0.contains(token) }) {
+                continue
+            }
+            let collapsedToken = token
+                .components(separatedBy: CharacterSet(charactersIn: "-_./"))
+                .joined()
+            if collapsedToken.isEmpty
+                || !collapsedHaystacks.contains(where: { $0.contains(collapsedToken) })
+            {
+                return false
+            }
+        }
+        return true
+    }
+}
+
 public struct DiscoveryEntry: Identifiable, Equatable, Sendable {
     public var id: String { repo }
     public var repo: String
@@ -82,7 +116,7 @@ public struct ForgeDiscoveryService: Sendable {
         /// new community forges) ranked below the fold and simply never
         /// existed for the user. 100 covers the live MTPLX result set
         /// (109 repos, 2026-08-16) minus a single-digit tail.
-        public init(search: String? = nil, limit: Int = 100, offset: Int = 0) {
+        public init(search: String? = nil, limit: Int = 500, offset: Int = 0) {
             self.search = search
             self.limit = limit
             self.offset = offset

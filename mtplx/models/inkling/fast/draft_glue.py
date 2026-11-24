@@ -468,19 +468,20 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
         h, residual = block(blk, h, residual, view, i)
     h = add_norm(h, residual, drafter.output_norm, drafter.cfg["rms_norm_eps"])[0][:, 1 : count_ + 1]
 
+    head = drafter.draft_head(target) if hasattr(drafter, "draft_head") else target.unembed
     base = None
-    if isinstance(target.unembed, AffineWeight):
+    if isinstance(head, AffineWeight):
         from .qproduct import STREAM_TYPES, affine_product
 
         try:
             if h.dtype in STREAM_TYPES:
-                base = affine_product(h, target.unembed, widen=True)[..., : drafter.vocab]
+                base = affine_product(h, head, widen=True)[..., : drafter.vocab]
             else:
-                base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
+                base = affine_product(h.astype(mx.float32), head)[..., : drafter.vocab]
         except RuntimeError:
             count("fallback.draft_head.affine_launch_refused")
     if base is None:
-        base = linear(h, target.unembed)[..., : drafter.vocab]
+        base = linear(h, head)[..., : drafter.vocab]
     rank = drafter.cfg["markov_rank"]
     weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
     inputs = mx.concatenate([h, mx.broadcast_to(view.last, h.shape)], axis=-1)

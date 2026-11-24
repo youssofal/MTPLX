@@ -1542,36 +1542,198 @@ class MaxSession:
             self.stop()
 
 
+_DESKTOP_MAC_MODEL_PREFIXES = ("MacStudio", "MacPro", "Macmini", "iMac")
+_LAPTOP_MAC_MODEL_PREFIXES = ("MacBook",)
+_DESKTOP_MAC_MODELS = frozenset(
+    {
+        "Mac13,1",
+        "Mac13,2",
+        "Mac14,3",
+        "Mac14,8",
+        "Mac14,12",
+        "Mac14,13",
+        "Mac14,14",
+        "Mac15,4",
+        "Mac15,5",
+        "Mac15,14",
+        "Mac16,2",
+        "Mac16,3",
+        "Mac16,9",
+        "Mac16,10",
+        "Mac16,11",
+    }
+)
+_LAPTOP_MAC_MODELS = frozenset(
+    {
+        "Mac14,2",
+        "Mac14,5",
+        "Mac14,6",
+        "Mac14,7",
+        "Mac14,9",
+        "Mac14,10",
+        "Mac14,15",
+        "Mac15,3",
+        "Mac15,6",
+        "Mac15,7",
+        "Mac15,8",
+        "Mac15,9",
+        "Mac15,10",
+        "Mac15,11",
+        "Mac15,12",
+        "Mac15,13",
+        "Mac16,1",
+        "Mac16,5",
+        "Mac16,6",
+        "Mac16,7",
+        "Mac16,8",
+        "Mac16,12",
+        "Mac16,13",
+        "Mac17,2",
+        "Mac17,6",
+        "Mac17,7",
+    }
+)
+
+
+def _sysctl_hw_model() -> str:
+    if sys.platform != "darwin":
+        return ""
+    probe = _run_probe(["/usr/sbin/sysctl", "-n", "hw.model"], timeout_s=1.0)
+    return str(probe.get("stdout") or "").strip() if probe.get("ok") else ""
+
+
+def _has_internal_battery() -> bool | None:
+    if sys.platform != "darwin":
+        return None
+    probe = _run_probe(["/usr/bin/pmset", "-g", "batt"], timeout_s=1.0)
+    stdout = str(probe.get("stdout") or "")
+    if not probe.get("ok") or not stdout.strip():
+        return None
+    return "InternalBattery" in stdout
+
+
+def is_desktop_mac() -> bool:
+    """Return True on desktop Macs (Mac Studio / Mac Pro / Mac mini / iMac)."""
+    override = (os.environ.get("MTPLX_DESKTOP_MAC") or "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    model = _sysctl_hw_model()
+    if not model:
+        return False
+    if model in _DESKTOP_MAC_MODELS or any(
+        model.startswith(prefix) for prefix in _DESKTOP_MAC_MODEL_PREFIXES
+    ):
+        return True
+    if model in _LAPTOP_MAC_MODELS or any(
+        model.startswith(prefix) for prefix in _LAPTOP_MAC_MODEL_PREFIXES
+    ):
+        return False
+    has_batt = _has_internal_battery()
+    return has_batt is False
+
+
+def _verify_rpm_target(summary: dict[str, Any], target_rpm: int) -> bool:
+    fans = _ok_fans(summary)
+    if not fans:
+        return False
+    tol = max(250, int(0.12 * target_rpm))
+    for fan in fans:
+        mode = str(fan.get("mode") or "").lower()
+        target = _int_or_none(fan.get("target_rpm"))
+        if mode != "auto" and target is not None and abs(target - target_rpm) <= tol:
+            return True
+    return False
+
+
+def set_fan_rpm(rpm: int, *, dry_run: bool = False) -> dict[str, Any]:
+    """Set manual target fan RPM via ThermalForge daemon socket or CLI."""
+    target_rpm = max(1000, int(rpm))
+    detection = detect_thermal_control()
+    selected = detection.get("selected")
+    if not selected or str(selected.get("kind")) != "thermalforge":
+        return {
+            "ok": False,
+            "unsupported_controller": True,
+            "rpm": target_rpm,
+            "dry_run": dry_run,
+            "detection": detection,
+            "attempts": [],
+            "message": "ThermalForge is required to set intermediate fan RPM.",
+        }
+    path = str(selected["path"])
+    commands = [
+        ["sudo", "-n", path, "set", str(target_rpm)],
+        [path, "set", str(target_rpm)],
+    ]
+    if dry_run:
+        return {
+            "ok": True,
+            "rpm": target_rpm,
+            "dry_run": True,
+            "detection": detection,
+            "command": commands[0],
+            "attempts": [],
+        }
+    attempts: list[dict[str, Any]] = []
+    sock_res = _daemon_socket_send(f"set {target_rpm}")
+    if sock_res is not None:
+        attempts.append(sock_res)
+        if sock_res.get("ok"):
+            verified = _verify_rpm_target(fan_summary(), target_rpm)
+            sock_res["verified"] = verified
+            if verified:
+                return {
+                    "ok": True,
+                    "rpm": target_rpm,
+                    "dry_run": False,
+                    "detection": detection,
+                    "command": sock_res["command"],
+                    "attempts": attempts,
+                }
+    for command in commands:
+        result = _run_probe(command, timeout_s=15.0)
+        attempts.append(result)
+        if result.get("ok"):
+            verified = _verify_rpm_target(fan_summary(), target_rpm)
+            result["verified"] = verified
+            if verified:
+                return {
+                    "ok": True,
+                    "rpm": target_rpm,
+                    "dry_run": False,
+                    "detection": detection,
+                    "command": command,
+                    "attempts": attempts,
+                }
+    return {
+        "ok": False,
+        "rpm": target_rpm,
+        "dry_run": False,
+        "detection": detection,
+        "attempts": attempts,
+        "message": f"ThermalForge could not set fan speed to {target_rpm} RPM.",
+    }
+
+
 class SmartFanController:
-    """Request-scoped max-fan lease for Smart fan mode.
+    """Request-scoped stepped temperature-gated fan controller for Smart mode.
 
-    Smart is intentionally lighter than ``MaxSession``: it commands max as
-    soon as a request arrives, without making the request wait for the fan
-    hardware. It reference-counts overlapping leases and restores Apple auto
-    only after the last lease has been idle for ``restore_delay_s``.
-
-    Contract (July 2026 overhaul, issue #127):
-    - ``begin_request``/``end_request`` never block and never run a
-      subprocess on the caller thread. All hardware commands execute on one
-      dedicated worker thread; the controller lock only guards state.
-      This is what allows the ramp to be issued at HTTP request arrival
-      (before prompt encoding and queueing) at zero request-path cost.
-    - After commanding max the worker verifies the daemon accepted the
-      target RPM (``fan_summary``) and retries the command once if not.
-      It then keeps polling until the physical ramp is visible. Ramp
-      latencies and verification state are surfaced via ``status()``
-      (and therefore ``/health``).
-    - The restore is debounced: back-to-back requests (agent tool loops,
-      generation -> idle-postcommit handoffs) reuse the ramp instead of
-      flapping the fans down and up again.
-    - ``detach()`` lets an external owner (Max mode) take over fan
-      hardware without a scheduled smart restore racing it back to auto.
+    Stays on Apple's quiet ``auto`` curve while a turn stays cool or short,
+    ramps in smooth RPM steps as SoC temperature rises (with desktop vs laptop
+    thresholds and 5C downward hysteresis), and restores ``auto`` cleanly
+    after ``restore_delay_s`` (plus heat-soak drain when ramped).
     """
 
     _ACTUAL_RAMP_TIMEOUT_S = 30.0
     _ACTUAL_RAMP_POLL_INTERVAL_S = 1.0
     _WAIT_FOR_RESTORE_TIMEOUT_S = 30.0
     _ACTIVITY_POLL_INTERVAL_S = 5.0
+    _ACTIVE_TEMP_POLL_S = 2.0
+    _STEP_HYSTERESIS_C = 5.0
+    _LAPTOP_STEPS = ((70.0, 0.55), (82.0, 0.80), (90.0, 1.0))
+    _DESKTOP_STEPS = ((75.0, 0.45), (85.0, 0.70), (92.0, 1.0))
     _RESTORE_RETRY_BACKOFF_S = (5.0, 15.0, 30.0, 60.0)
     _SOAK_PROBE_INTERVAL_S = 5.0
 
@@ -1581,16 +1743,21 @@ class SmartFanController:
         log: Any = None,
         restore_delay_s: float = 2.0,
         activity_probe: Any = None,
+        sensorless_delay_s: float | None = None,
+        desktop: bool | None = None,
     ) -> None:
         self.log = log
         self.restore_delay_s = max(0.0, float(restore_delay_s))
-        # Optional callable returning True while the engine is executing or
-        # queueing model work. Powers the stale-lease reconciler (#201): a
-        # lease held while the engine has been continuously idle for
-        # MTPLX_SMART_FAN_STALE_LEASE_S seconds is a leak upstream (hung
-        # HTTP response, abandoned future), not a running request, and must
-        # not pin the fans forever. 0 disables the reconciler.
         self._activity_probe = activity_probe
+        if sensorless_delay_s is None:
+            try:
+                sensorless_delay_s = float(
+                    os.environ.get("MTPLX_SMART_FAN_SENSORLESS_DELAY_S", "8")
+                )
+            except ValueError:
+                sensorless_delay_s = 8.0
+        self._sensorless_delay_s = max(0.0, float(sensorless_delay_s))
+        self._desktop_mac = bool(is_desktop_mac() if desktop is None else desktop)
         try:
             self._stale_lease_idle_s = max(
                 0.0, float(os.environ.get("MTPLX_SMART_FAN_STALE_LEASE_S", "120"))
@@ -1602,6 +1769,15 @@ class SmartFanController:
         self._active_requests: set[str] = set()
         self._cleanup: Any | None = None
         self._generation = 0
+        self._detach_epoch = 0
+        self._hw_op_in_flight = False
+        self._current_level = 0
+        self._current_target_rpm: int | None = None
+        self._active_started_at: float | None = None
+        self._next_temp_probe_at: float | None = None
+        self._last_active_temp_c: float | None = None
+        self._last_active_sensor: str | None = None
+        self._step_evaluated_generation = 0
         self._commanded_max = False
         self._target_verified = False
         self._actual_ramp_verified = False
@@ -1616,24 +1792,12 @@ class SmartFanController:
         self._last_transition_at: float | None = None
         self._last_result: dict[str, Any] | None = None
         self._last_error: str | None = None
-        # #201 restore-retry state: a restore that ran but could not verify
-        # the fans back on the auto curve re-arms with backoff instead of
-        # being forgotten while the hardware stays pinned.
         self._restore_unverified = False
         self._restore_retry_at: float | None = None
         self._restore_failures = 0
         self._engine_idle_since: float | None = None
         self._next_activity_probe_at: float | None = None
         self._stale_leases_reconciled = 0
-        # Heat-soak release hold (#227): under bursty agent load the SoC
-        # soaks past 90C during a burst and the Apple auto curve is too lazy
-        # to drain it during the short idle gaps, so every following turn
-        # runs throttled (field A/B: -51% decode). After the idle debounce,
-        # keep the fans at max until the die has actually cooled below the
-        # release threshold — bounded by a hard hold cap so fans can never
-        # stay pinned on an idle machine, and falling back to the legacy
-        # instant restore whenever no die temperature is readable.
-        # MTPLX_SMART_FAN_SOAK_RELEASE_C=0 disables the hold entirely.
         try:
             self._soak_release_temp_c = float(
                 os.environ.get("MTPLX_SMART_FAN_SOAK_RELEASE_C", "75")
@@ -1664,6 +1828,51 @@ class SmartFanController:
             except Exception:
                 pass
 
+    def _steps(self) -> tuple[tuple[float, float], ...]:
+        return self._DESKTOP_STEPS if self._desktop_mac else self._LAPTOP_STEPS
+
+    def _desired_level_for_temp(self, temp_c: float, current_level: int) -> int:
+        steps = self._steps()
+        t1, t2, t3 = steps[0][0], steps[1][0], steps[2][0]
+        hyst = self._STEP_HYSTERESIS_C
+        if temp_c >= t3 or (current_level >= 3 and temp_c > t3 - hyst):
+            return 3
+        if temp_c >= t2 or (current_level >= 2 and temp_c > t2 - hyst):
+            return 2
+        if temp_c >= t1 or (current_level >= 1 and temp_c > t1 - hyst):
+            return 1
+        return 0
+
+    def _target_rpm_for_level(self, level: int) -> int:
+        fraction = self._steps()[max(0, min(2, level - 1))][1]
+        summary = fan_summary()
+        fans = _ok_fans(summary) or []
+        lows: list[int] = []
+        highs: list[int] = []
+        for fan in fans:
+            raw = fan.get("raw") if isinstance(fan.get("raw"), dict) else {}
+            low = _int_or_none(raw.get("min_rpm"))
+            high = _fan_max_capacity(fan)
+            lows.append(low if low and low > 0 else 1100)
+            highs.append(high if high and high > 0 else 4000)
+        low_rpm = sum(lows) / len(lows) if lows else 1100.0
+        high_rpm = sum(highs) / len(highs) if highs else 4000.0
+        return max(1000, int(round(low_rpm + fraction * max(500.0, high_rpm - low_rpm))))
+
+    def _ensure_lifecycle_hooks(self) -> None:
+        try:
+            check_and_recover_stale_max()
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"stale_recovery:{type(exc).__name__}: {exc}"
+        with self._lock:
+            needs_hooks = self._cleanup is None
+        if needs_hooks:
+            hooks = install_max_lifecycle_hooks()
+            with self._lock:
+                if self._cleanup is None:
+                    self._cleanup = hooks
+
     # -- public lease API (non-blocking) ---------------------------------
 
     def begin_request(self, request_id: str) -> dict[str, Any]:
@@ -1671,13 +1880,15 @@ class SmartFanController:
         with self._cond:
             if request_key in self._active_requests:
                 return self._status_locked()
+            was_idle = not self._active_requests
             self._active_requests.add(request_key)
             self._generation += 1
             self._idle_since = None
             self._engine_idle_since = None
-            # New lease: stale soak readings from a previous idle window must
-            # not decide the next release, and a transient probe failure must
-            # not disable the hold forever.
+            now = time.monotonic()
+            if was_idle:
+                self._active_started_at = now
+            self._next_temp_probe_at = 0.0
             self._soak_bypass = False
             self._soak_probe_failed = False
             self._soak_holding = False
@@ -1686,7 +1897,7 @@ class SmartFanController:
             self._soak_next_probe_at = None
             self._soak_release_reason = None
             if not self._commanded_max and self._ramp_requested_at is None:
-                self._ramp_requested_at = time.monotonic()
+                self._ramp_requested_at = now
             self._ensure_worker_locked()
             self._cond.notify_all()
             return self._status_locked()
@@ -1700,15 +1911,18 @@ class SmartFanController:
             if became_idle:
                 self._idle_since = time.monotonic()
                 if wait_for_restore:
-                    # Skip the debounce (and the heat-soak hold) for explicit
-                    # synchronous restores (bench lanes, shutdown paths).
                     self._idle_since -= self.restore_delay_s
                     self._soak_bypass = True
             self._ensure_worker_locked()
             self._cond.notify_all()
             if not became_idle:
                 return self._status_locked()
-            if not self._commanded_max and self._cleanup is None:
+            if (
+                not self._commanded_max
+                and self._current_level == 0
+                and self._cleanup is None
+                and not self._hw_op_in_flight
+            ):
                 return self._status_locked()
         if wait_for_restore:
             self._wait_until_restored()
@@ -1727,16 +1941,15 @@ class SmartFanController:
         return self.status()
 
     def detach(self) -> dict[str, Any]:
-        """Drop all leases and pending fan work WITHOUT touching hardware.
-
-        Used when an external owner takes over fan control (switching the
-        server to Max mode): the old behavior scheduled a delayed smart
-        restore that could fire *after* the Max pin landed and silently
-        drop fans back to auto while the UI showed Max (issue #127).
-        """
+        """Drop all leases and pending fan work WITHOUT touching hardware."""
         with self._cond:
             self._active_requests.clear()
             self._generation += 1
+            self._detach_epoch += 1
+            self._current_level = 0
+            self._current_target_rpm = None
+            self._active_started_at = None
+            self._next_temp_probe_at = None
             self._commanded_max = False
             self._target_verified = False
             self._actual_ramp_verified = False
@@ -1744,8 +1957,6 @@ class SmartFanController:
             self._actual_poll_deadline = None
             self._next_actual_probe_at = None
             self._idle_since = None
-            # The external owner (Max mode) owns the hardware now: pending
-            # restore retries and idle bookkeeping belong to the old regime.
             self._restore_unverified = False
             self._restore_retry_at = None
             self._restore_failures = 0
@@ -1757,32 +1968,35 @@ class SmartFanController:
             self._soak_last_sensor = None
             self._soak_next_probe_at = None
             self._soak_release_reason = None
-            # Drop our reference so the worker does not schedule a restore;
-            # the atexit hook installed by install_max_lifecycle_hooks stays
-            # registered and still restores fans on process exit.
             self._cleanup = None
             self._cond.notify_all()
             return self._status_locked()
 
     def wait_for_ramp(self, timeout_s: float = 10.0) -> bool:
-        """Block until the worker has commanded max (True) or the ramp
-        attempt for the current lease generation failed / timed out (False).
-
-        The request path never calls this — it exists for bench lanes,
-        tests, and QA probes that need a synchronization point with the
-        async worker.
-        """
+        """Block until the worker has commanded a fan boost (True) or failed (False)."""
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         with self._cond:
             while True:
-                if self._commanded_max:
+                if self._commanded_max or self._current_level > 0:
                     return True
                 if self._ramp_failed_generation == self._generation:
                     return False
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return bool(self._commanded_max)
+                    return bool(self._commanded_max or self._current_level > 0)
                 self._cond.wait(timeout=remaining)
+
+    def wait_for_step(self, timeout_s: float = 5.0) -> int:
+        """Wait until the current lease generation has evaluated its temperature step."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._cond:
+            target_gen = self._generation
+            while self._step_evaluated_generation < target_gen:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._current_level
+                self._cond.wait(timeout=remaining)
+            return self._current_level
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1793,6 +2007,10 @@ class SmartFanController:
             "active": bool(self._active_requests),
             "active_count": len(self._active_requests),
             "active_requests": sorted(self._active_requests),
+            "current_level": self._current_level,
+            "current_target_rpm": self._current_target_rpm,
+            "profile_kind": "desktop" if self._desktop_mac else "laptop",
+            "active_temp_c": self._last_active_temp_c,
             "commanded_max": bool(self._commanded_max),
             "target_verified": bool(self._target_verified),
             "actual_ramp_verified": bool(self._actual_ramp_verified),
@@ -1829,7 +2047,12 @@ class SmartFanController:
     def _wait_until_restored(self) -> None:
         deadline = time.monotonic() + self._WAIT_FOR_RESTORE_TIMEOUT_S
         with self._cond:
-            while self._commanded_max and not self._active_requests:
+            while (
+                self._commanded_max
+                or self._current_level > 0
+                or self._cleanup is not None
+                or self._hw_op_in_flight
+            ) and not self._active_requests:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return
@@ -1839,9 +2062,6 @@ class SmartFanController:
         return self._activity_probe is not None and self._stale_lease_idle_s > 0
 
     def _wait_capped_by_activity_probe_locked(self, timeout: float | None, now: float) -> None:
-        """cond.wait, but never sleep past the next activity-probe slot while
-        leases are active and the reconciler is enabled — a wedged lease must
-        still get its periodic engine-idle check (#201)."""
         if self._active_requests and self._reconciler_enabled_locked():
             probe_in = max(0.05, (self._next_activity_probe_at or now) - now)
             timeout = probe_in if timeout is None else min(timeout, probe_in)
@@ -1855,23 +2075,42 @@ class SmartFanController:
                     if self._shutdown:
                         return
                     now = time.monotonic()
-                    desired_max = bool(self._active_requests)
+                    desired_active = bool(self._active_requests)
                     if (
-                        desired_max
+                        desired_active
                         and self._reconciler_enabled_locked()
                         and now >= (self._next_activity_probe_at or 0.0)
                     ):
                         action = "probe_activity"
-                    elif desired_max and not self._commanded_max:
+                    elif desired_active:
                         if self._ramp_failed_generation == self._generation:
-                            # The last ramp (with its retry) failed for this
-                            # lease generation; don't hammer the daemon.
-                            # A new begin_request bumps the generation and
-                            # re-arms the attempt.
                             self._wait_capped_by_activity_probe_locked(None, now)
                             continue
-                        action = "ramp"
-                    elif not desired_max and (self._commanded_max or self._cleanup is not None):
+                        next_temp = self._next_temp_probe_at or 0.0
+                        if now >= next_temp:
+                            action = "step_active"
+                        elif (
+                            self._commanded_max
+                            and not self._actual_ramp_verified
+                            and self._actual_poll_deadline is not None
+                            and now >= (self._next_actual_probe_at or 0.0)
+                        ):
+                            action = "probe_actual"
+                        else:
+                            waits = [max(0.01, next_temp - now)]
+                            if (
+                                self._commanded_max
+                                and not self._actual_ramp_verified
+                                and self._actual_poll_deadline is not None
+                            ):
+                                waits.append(
+                                    max(0.05, (self._next_actual_probe_at or now) - now)
+                                )
+                            self._wait_capped_by_activity_probe_locked(min(waits), now)
+                    elif (
+                        not desired_active
+                        and (self._commanded_max or self._current_level > 0 or self._cleanup is not None)
+                    ):
                         if self._idle_since is None:
                             self._idle_since = now
                         remaining = self._idle_since + self.restore_delay_s - now
@@ -1889,30 +2128,17 @@ class SmartFanController:
                                 self._cond.wait(timeout=max(0.05, hold_until - now))
                             else:
                                 action = "restore"
-                    elif not desired_max and self._restore_unverified:
-                        # A previous restore ran but the fans never verified
-                        # back on the auto curve (#201). Keep retrying with
-                        # backoff until they do or a new lease re-ramps.
+                    elif not desired_active and self._restore_unverified:
                         retry_in = (self._restore_retry_at or now) - now
                         if retry_in <= 0:
                             action = "restore"
                         else:
                             self._cond.wait(timeout=max(0.05, retry_in))
-                    elif (
-                        desired_max
-                        and self._commanded_max
-                        and not self._actual_ramp_verified
-                        and self._actual_poll_deadline is not None
-                    ):
-                        if now >= (self._next_actual_probe_at or 0.0):
-                            action = "probe_actual"
-                        else:
-                            self._wait_capped_by_activity_probe_locked(
-                                max(0.05, (self._next_actual_probe_at or now) - now), now
-                            )
                     else:
                         self._wait_capped_by_activity_probe_locked(None, now)
-            if action == "ramp":
+            if action == "step_active":
+                self._do_step_active()
+            elif action == "ramp":
                 self._do_ramp()
             elif action == "restore":
                 self._do_restore()
@@ -1924,15 +2150,8 @@ class SmartFanController:
                 self._do_probe_soak()
 
     def _soak_decision_locked(self, now: float) -> str:
-        """After the idle debounce elapses: restore now, probe, or hold (#227).
-
-        Returns "restore" | "probe" | "hold". Fails open: any state in which
-        a die temperature cannot be trusted resolves to "restore" (the
-        pre-#227 behavior), and the hold cap bounds the pin regardless of
-        sensor state so an idle machine always gets its fans back.
-        """
-        if not self._commanded_max:
-            return "restore"  # nothing ramped, nothing soaked to drain
+        if not self._commanded_max and self._current_level == 0:
+            return "restore"  # stayed on auto: nothing ramped, nothing soaked
         if (
             self._soak_bypass
             or self._soak_probe_failed
@@ -1952,6 +2171,208 @@ class SmartFanController:
         if now >= (self._soak_next_probe_at or 0.0):
             return "probe"
         return "hold"
+
+    def _is_stale_generation_locked(self, generation: int) -> bool:
+        return (
+            self._generation != generation
+            or self._shutdown
+            or not self._active_requests
+        )
+
+    def _is_detached_locked(self, detach_epoch: int) -> bool:
+        return self._detach_epoch != detach_epoch or self._shutdown
+
+    def _do_step_active(self) -> None:
+        with self._lock:
+            generation = self._generation
+            detach_epoch = self._detach_epoch
+            current_level = self._current_level
+            active_started_at = self._active_started_at or time.monotonic()
+            self._active_started_at = active_started_at
+        try:
+            reading = soc_temperature_c()
+        except Exception:
+            reading = {"ok": False, "celsius": None, "sensor": None}
+        now = time.monotonic()
+        with self._lock:
+            if self._is_stale_generation_locked(generation):
+                return
+        if reading.get("ok") and reading.get("celsius") is not None:
+            temp_c = float(reading["celsius"])
+            sensor = reading.get("sensor")
+            target_level = self._desired_level_for_temp(temp_c, current_level)
+            if target_level == current_level:
+                with self._cond:
+                    if self._is_stale_generation_locked(generation):
+                        return
+                    self._last_active_temp_c = temp_c
+                    self._last_active_sensor = sensor
+                    self._step_evaluated_generation = max(
+                        self._step_evaluated_generation, generation
+                    )
+                    self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
+                    self._cond.notify_all()
+                return
+            if target_level == 3:
+                with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        return
+                    self._last_active_temp_c = temp_c
+                    self._last_active_sensor = sensor
+                self._do_ramp()
+                with self._cond:
+                    if self._is_stale_generation_locked(generation):
+                        return
+                    self._step_evaluated_generation = max(
+                        self._step_evaluated_generation, generation
+                    )
+                    self._next_temp_probe_at = time.monotonic() + self._ACTIVE_TEMP_POLL_S
+                    self._cond.notify_all()
+                return
+            if target_level in (1, 2):
+                rpm = self._target_rpm_for_level(target_level)
+                res: dict[str, Any] = {"ok": False}
+                err: str | None = None
+                with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        return
+                    self._hw_op_in_flight = True
+                try:
+                    for _attempt in range(2):
+                        with self._lock:
+                            if self._is_stale_generation_locked(generation):
+                                break
+                        try:
+                            res = set_fan_rpm(rpm)
+                        except Exception as exc:
+                            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                        if res.get("ok"):
+                            err = None
+                            break
+                        err = str(res.get("message") or res.get("error") or "set_fan_rpm failed")
+                        if res.get("unsupported_controller"):
+                            break
+                    if res.get("unsupported_controller"):
+                        with self._lock:
+                            if self._is_stale_generation_locked(generation):
+                                return
+                            self._last_active_temp_c = temp_c
+                            self._last_active_sensor = sensor
+                        self._do_ramp()
+                        with self._cond:
+                            if self._is_stale_generation_locked(generation):
+                                return
+                            self._step_evaluated_generation = max(
+                                self._step_evaluated_generation, generation
+                            )
+                            self._next_temp_probe_at = (
+                                time.monotonic() + self._ACTIVE_TEMP_POLL_S
+                            )
+                            self._cond.notify_all()
+                        return
+                    if res.get("ok"):
+                        with self._lock:
+                            if self._is_detached_locked(detach_epoch):
+                                return
+                        self._ensure_lifecycle_hooks()
+                    now = time.monotonic()
+                    with self._cond:
+                        if res.get("ok"):
+                            if self._is_detached_locked(detach_epoch):
+                                return
+                        elif self._is_stale_generation_locked(generation):
+                            return
+                        self._last_active_temp_c = temp_c
+                        self._last_active_sensor = sensor
+                        self._last_result = res
+                        self._last_transition_at = time.time()
+                        if res.get("ok"):
+                            self._current_level = target_level
+                            self._current_target_rpm = rpm
+                            self._commanded_max = False
+                            self._target_verified = True
+                            self._last_error = None
+                            self._emit(
+                                f"[smart-fan] stepped to level {target_level} "
+                                f"({rpm} RPM at {temp_c:.1f}C)"
+                            )
+                        else:
+                            self._last_error = err
+                            self._ramp_failed_generation = generation
+                        self._step_evaluated_generation = max(
+                            self._step_evaluated_generation, generation
+                        )
+                        self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
+                        self._cond.notify_all()
+                    return
+                finally:
+                    with self._cond:
+                        self._hw_op_in_flight = False
+                        self._cond.notify_all()
+            # Step down to quiet auto (target_level == 0 and current_level > 0)
+            with self._lock:
+                if self._is_stale_generation_locked(generation):
+                    return
+                self._hw_op_in_flight = True
+            try:
+                try:
+                    res = set_thermal_profile("silent")
+                except Exception as exc:
+                    res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                now = time.monotonic()
+                with self._cond:
+                    if self._is_detached_locked(detach_epoch):
+                        return
+                    self._last_active_temp_c = temp_c
+                    self._last_active_sensor = sensor
+                    self._last_result = res
+                    self._last_transition_at = time.time()
+                    if res.get("ok"):
+                        self._current_level = 0
+                        self._current_target_rpm = None
+                        self._commanded_max = False
+                        self._target_verified = False
+                        self._actual_ramp_verified = False
+                        self._last_error = None
+                    else:
+                        self._last_error = str(
+                            res.get("message") or res.get("error") or "step-down auto failed"
+                        )
+                    self._step_evaluated_generation = max(
+                        self._step_evaluated_generation, generation
+                    )
+                    self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
+                    self._cond.notify_all()
+                return
+            finally:
+                with self._cond:
+                    self._hw_op_in_flight = False
+                    self._cond.notify_all()
+
+        # Sensorless fallback: stay quiet on short turns, ramp after sensorless_delay_s.
+        if now - active_started_at >= self._sensorless_delay_s:
+            if current_level < 3:
+                self._do_ramp()
+            with self._cond:
+                if self._is_stale_generation_locked(generation):
+                    return
+                self._step_evaluated_generation = max(
+                    self._step_evaluated_generation, generation
+                )
+                self._next_temp_probe_at = time.monotonic() + self._ACTIVE_TEMP_POLL_S
+                self._cond.notify_all()
+            return
+        with self._cond:
+            if self._is_stale_generation_locked(generation):
+                return
+            self._step_evaluated_generation = max(
+                self._step_evaluated_generation, generation
+            )
+            self._next_temp_probe_at = min(
+                now + self._ACTIVE_TEMP_POLL_S,
+                active_started_at + self._sensorless_delay_s,
+            )
+            self._cond.notify_all()
 
     def _do_probe_soak(self) -> None:
         try:
@@ -1982,8 +2403,6 @@ class SmartFanController:
                         f"{self._soak_last_sensor} {self._soak_last_temp_c:.1f}C — releasing"
                     )
             else:
-                # No usable die temperature on this machine/tool: restore on
-                # the legacy debounce instead of pinning fans on a blind hold.
                 self._soak_probe_failed = True
             self._soak_next_probe_at = now + self._SOAK_PROBE_INTERVAL_S
             self._cond.notify_all()
@@ -1991,66 +2410,76 @@ class SmartFanController:
     def _do_ramp(self) -> None:
         with self._lock:
             generation = self._generation
+            detach_epoch = self._detach_epoch
+            if self._is_stale_generation_locked(generation):
+                return
             requested_at = self._ramp_requested_at or time.monotonic()
+            self._hw_op_in_flight = True
         try:
-            check_and_recover_stale_max()
-        except Exception as exc:
-            with self._lock:
-                self._last_error = f"stale_recovery:{type(exc).__name__}: {exc}"
-        with self._lock:
-            needs_hooks = self._cleanup is None
-        if needs_hooks:
-            hooks = install_max_lifecycle_hooks()
-            with self._lock:
-                if self._cleanup is None:
-                    self._cleanup = hooks
-        result: dict[str, Any] | None = None
-        error: str | None = None
-        ok = False
-        attempts = 0
-        for _attempt in range(2):  # initial command + one bounded retry
-            attempts += 1
-            try:
-                result = set_thermal_profile("performance")
-            except Exception as exc:
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if not result.get("ok"):
-                error = str(result.get("message") or result.get("error") or "max command failed")
-                continue
-            try:
-                summary = fan_summary()
-            except Exception as exc:
-                summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if _summary_indicates_max(summary):
-                ok = True
-                error = None
-                break
-            error = "daemon accepted the command but is not commanding max target RPM"
-        now = time.monotonic()
-        with self._cond:
-            self._ramp_attempts += attempts
-            self._last_result = result
-            self._last_transition_at = time.time()
-            self._commanded_max = ok
-            self._target_verified = ok
-            if ok:
-                self._last_error = None
-                self._ramp_latency_s = now - requested_at
-                self._actual_ramp_verified = False
-                self._actual_poll_deadline = now + self._ACTUAL_RAMP_TIMEOUT_S
-                self._next_actual_probe_at = now
-                self._emit(
-                    "[smart-fan] max commanded and target verified in "
-                    f"{self._ramp_latency_s:.2f}s (attempt {attempts})"
-                )
-            else:
-                self._last_error = error
-                self._ramp_failed_generation = generation
-                self._emit(
-                    f"[smart-fan] ramp FAILED after {attempts} attempt(s): {error} "
-                    "— run `mtplx max --status` to check ThermalForge"
-                )
-            self._cond.notify_all()
+            self._ensure_lifecycle_hooks()
+            result: dict[str, Any] | None = None
+            error: str | None = None
+            ok = False
+            attempts = 0
+            for _attempt in range(2):
+                with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        break
+                attempts += 1
+                try:
+                    result = set_thermal_profile("performance")
+                except Exception as exc:
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if not result.get("ok"):
+                    error = str(result.get("message") or result.get("error") or "max command failed")
+                    continue
+                try:
+                    summary = fan_summary()
+                except Exception as exc:
+                    summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if _summary_indicates_max(summary):
+                    ok = True
+                    error = None
+                    break
+                error = "daemon accepted the command but is not commanding max target RPM"
+            now = time.monotonic()
+            with self._cond:
+                if ok:
+                    if self._is_detached_locked(detach_epoch):
+                        return
+                elif self._is_stale_generation_locked(generation):
+                    return
+                if not attempts:
+                    return
+                self._ramp_attempts += attempts
+                self._last_result = result
+                self._last_transition_at = time.time()
+                self._commanded_max = ok
+                self._target_verified = ok
+                if ok:
+                    self._current_level = 3
+                    self._current_target_rpm = None
+                    self._last_error = None
+                    self._ramp_latency_s = now - requested_at
+                    self._actual_ramp_verified = False
+                    self._actual_poll_deadline = now + self._ACTUAL_RAMP_TIMEOUT_S
+                    self._next_actual_probe_at = now
+                    self._emit(
+                        "[smart-fan] max commanded and target verified in "
+                        f"{self._ramp_latency_s:.2f}s (attempt {attempts})"
+                    )
+                else:
+                    self._last_error = error
+                    self._ramp_failed_generation = generation
+                    self._emit(
+                        f"[smart-fan] ramp FAILED after {attempts} attempt(s): {error} "
+                        "— run `mtplx max --status` to check ThermalForge"
+                    )
+                self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._hw_op_in_flight = False
+                self._cond.notify_all()
 
     def _do_probe_actual(self) -> None:
         try:
@@ -2085,14 +2514,6 @@ class SmartFanController:
             self._cond.notify_all()
 
     def _do_probe_activity(self) -> None:
-        """Stale-lease reconciler (#201). A smart-fan lease is only legitimate
-        while its request is somewhere in the engine (queued, executing, or
-        streaming tokens). If leases are held while the activity probe reports
-        the engine continuously idle for ``_stale_lease_idle_s`` seconds, the
-        leases are leaked bookkeeping from a wedged request path: drop them,
-        log loudly, and let the normal restore flow bring the fans back to
-        auto. The probe fails open (busy) so a broken probe can never restore
-        fans under a live workload."""
         busy = True
         probe = self._activity_probe
         if probe is not None:
@@ -2147,6 +2568,10 @@ class SmartFanController:
             self._last_result = result
             self._last_transition_at = time.time()
             if result.get("ok"):
+                self._current_level = 0
+                self._current_target_rpm = None
+                self._active_started_at = None
+                self._next_temp_probe_at = None
                 self._commanded_max = False
                 self._target_verified = False
                 self._actual_ramp_verified = False
@@ -2165,13 +2590,10 @@ class SmartFanController:
                 self._last_error = str(
                     result.get("message") or result.get("error") or "restore failed"
                 )
-                # #201: a failed restore used to be marked "restored" and
-                # forgotten, leaving the physical fans pinned at max until
-                # the next request cycle happened to fix them. Keep the
-                # clean-slate contract for the NEXT lease (commanded_max
-                # drops so a new request re-commands max), but re-arm the
-                # restore with backoff so the hardware is actually brought
-                # back to auto even when no further request ever arrives.
+                self._current_level = 0
+                self._current_target_rpm = None
+                self._active_started_at = None
+                self._next_temp_probe_at = None
                 self._commanded_max = False
                 self._target_verified = False
                 self._actual_ramp_verified = False

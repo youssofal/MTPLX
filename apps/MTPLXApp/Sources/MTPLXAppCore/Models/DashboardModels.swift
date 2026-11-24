@@ -697,6 +697,28 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
     public var ssdCachedTokens: Int? { values["ssd_cached_tokens"]?.intValue }
     public var ssdRestoreS: Double? { values["ssd_restore_s"]?.doubleValue }
     public var ssdSuffixTokens: Int? { values["ssd_suffix_tokens"]?.intValue }
+    /// Kind of first visible output the stream sent after reasoning
+    /// (`"tool_call"`, `"text"`, or nil from older servers).
+    public var firstVisibleKind: String? {
+        guard let raw = values["first_visible_kind"]?.stringValue else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    /// Effective reasoning effort resolved by the engine for this request
+    /// (e.g. `"xhigh"`, `"high"`, `"medium"`, `"low"`).
+    public var resolvedReasoningEffort: String? {
+        let keys = ["resolved_reasoning_effort", "effective_reasoning_effort", "reasoning_effort"]
+        for key in keys {
+            if let raw = values[key]?.stringValue {
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        return nil
+    }
+    public var draftTimeS: Double? { values["draft_time_s"]?.doubleValue }
+    public var verifyTimeS: Double? { values["verify_time_s"]?.doubleValue }
+    public var verifyForwardTimeS: Double? { values["verify_forward_time_s"]?.doubleValue }
     public var requestCacheVerdict: RequestCacheVerdict {
         switch values["session_cache_hit"]?.boolValue {
         case true: return .hit
@@ -822,11 +844,51 @@ public struct SessionBankPrefix: Codable, Equatable, Identifiable, Sendable {
     public var tokenHash: String?
     public var prefixLen: Int
     public var hits: Int
+    public var cumulativeHits: Int?
     public var nbytes: Int
+    public var heldNbytes: Int?
     public var createdAtS: Double
     public var lastAccessS: Double
     public var policyFingerprint: String?
     public var hasLiveRef: Bool?
+
+    public init(
+        sessionId: String,
+        tokenHash: String? = nil,
+        prefixLen: Int,
+        hits: Int,
+        cumulativeHits: Int? = nil,
+        nbytes: Int,
+        heldNbytes: Int? = nil,
+        createdAtS: Double,
+        lastAccessS: Double,
+        policyFingerprint: String? = nil,
+        hasLiveRef: Bool? = nil
+    ) {
+        self.sessionId = sessionId
+        self.tokenHash = tokenHash
+        self.prefixLen = prefixLen
+        self.hits = hits
+        self.cumulativeHits = cumulativeHits
+        self.nbytes = nbytes
+        self.heldNbytes = heldNbytes
+        self.createdAtS = createdAtS
+        self.lastAccessS = lastAccessS
+        self.policyFingerprint = policyFingerprint
+        self.hasLiveRef = hasLiveRef
+    }
+
+    /// Bytes actually held in RAM for this prefix. Live-reference leases carry
+    /// `nbytes == 0` while `held_nbytes` holds the true KV cache footprint.
+    public var effectiveNbytes: Int {
+        max(heldNbytes ?? 0, nbytes)
+    }
+
+    /// Cumulative hit count for this prefix, preferring explicit cumulative
+    /// totals when present.
+    public var effectiveHits: Int {
+        max(cumulativeHits ?? 0, hits)
+    }
 
     // One conversation can retain several distinct prefix snapshots.
     // Keep each tile stable as its hit count and access time change.
@@ -842,7 +904,9 @@ public struct SessionBankPrefix: Codable, Equatable, Identifiable, Sendable {
         case tokenHash = "token_hash"
         case prefixLen = "prefix_len"
         case hits
+        case cumulativeHits = "cumulative_hits"
         case nbytes
+        case heldNbytes = "held_nbytes"
         case createdAtS = "created_at_s"
         case lastAccessS = "last_access_s"
         case policyFingerprint = "policy_fingerprint"
@@ -942,6 +1006,12 @@ public struct SessionBank: Codable, Equatable, Sendable {
     public var perSessionMaxBytes: Int?
     public var entries: Int?
     public var totalNbytes: Int?
+    public var heldNbytes: Int?
+    public var leaseNbytes: Int?
+    public var hits: Int?
+    public var ramHits: Int?
+    public var ssdHits: Int?
+    public var cumulativeHits: Int?
     public var lastMissReason: String?
     public var lastRestoreSource: String?
     public var lastSsdRestoreS: Double?
@@ -956,6 +1026,12 @@ public struct SessionBank: Codable, Equatable, Sendable {
         case perSessionMaxBytes = "per_session_max_bytes"
         case entries
         case totalNbytes = "total_nbytes"
+        case heldNbytes = "held_nbytes"
+        case leaseNbytes = "lease_nbytes"
+        case hits
+        case ramHits = "ram_hits"
+        case ssdHits = "ssd_hits"
+        case cumulativeHits = "cumulative_hits"
         case lastMissReason = "last_miss_reason"
         case lastRestoreSource = "last_restore_source"
         case lastSsdRestoreS = "last_ssd_restore_s"
@@ -967,8 +1043,20 @@ public struct SessionBank: Codable, Equatable, Sendable {
 
     public var restoreHitCount: Int {
         let coldHits = coldTier?.restoreHits ?? 0
-        let prefixHits = prefixes?.reduce(0) { $0 + max(0, $1.hits) } ?? 0
-        return max(coldHits, prefixHits)
+        let prefixHits = prefixes?.reduce(0) { $0 + max(0, $1.effectiveHits) } ?? 0
+        let tierSum = (ramHits ?? 0) + (ssdHits ?? 0)
+        return max(coldHits, prefixHits, hits ?? 0, tierSum, cumulativeHits ?? 0)
+    }
+
+    /// Total bytes held in RAM across the bank, preserving `held_nbytes` and
+    /// `lease_nbytes` so live-reference entries never misreport as 0 KB.
+    public var effectiveTotalNbytes: Int? {
+        let prefixSum = prefixes?.reduce(0) { $0 + max(0, $1.effectiveNbytes) } ?? 0
+        let explicitMax = [totalNbytes, heldNbytes, leaseNbytes].compactMap { $0 }.max()
+        if prefixSum > 0 {
+            return max(explicitMax ?? 0, prefixSum)
+        }
+        return explicitMax
     }
 
     public var lastEffectiveCachedTokens: Int? {
@@ -1015,17 +1103,52 @@ public struct SessionBank: Codable, Equatable, Sendable {
 }
 
 public struct SessionRow: Codable, Equatable, Sendable, Identifiable {
+    public struct Boundary: Codable, Equatable, Sendable {
+        public var nbytes: Int?
+        public var heldNbytes: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case nbytes
+            case heldNbytes = "held_nbytes"
+        }
+    }
+
     public var id: String { sessionId }
     public var sessionId: String
     public var prefixLen: Int
     public var bytes: Int
+    public var heldNbytes: Int?
+    public var heldBytes: Int?
+    public var nbytes: Int?
+    public var hits: Int?
+    public var cumulativeHits: Int?
+    public var boundaries: [Boundary]?
     public var inFlight: Bool?
     public var lastAccessS: Double
+
+    /// Non-zero memory held by this session, reading `held_nbytes` / `nbytes`
+    /// and boundary sizes whenever `bytes` is 0 on a live-reference session.
+    public var effectiveBytes: Int {
+        let boundaryMax = boundaries?.reduce(0) { acc, boundary in
+            max(acc, max(boundary.heldNbytes ?? 0, boundary.nbytes ?? 0))
+        } ?? 0
+        return max(bytes, heldNbytes ?? 0, heldBytes ?? 0, nbytes ?? 0, boundaryMax)
+    }
+
+    public var effectiveHits: Int? {
+        [hits, cumulativeHits].compactMap { $0 }.max()
+    }
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case prefixLen = "prefix_len"
         case bytes
+        case heldNbytes = "held_nbytes"
+        case heldBytes = "held_bytes"
+        case nbytes
+        case hits
+        case cumulativeHits = "cumulative_hits"
+        case boundaries
         case inFlight = "in_flight"
         case lastAccessS = "last_access_s"
     }
@@ -1122,6 +1245,33 @@ public struct ThermalFan: Codable, Equatable, Sendable {
     public var actualRpm: Int?
     public var maxCapacityRpm: Int?
     public var mode: String?
+    public var raw: DynamicObject?
+
+    public init(
+        rpm: Int? = nil,
+        targetRpm: Int? = nil,
+        actualRpm: Int? = nil,
+        maxCapacityRpm: Int? = nil,
+        mode: String? = nil,
+        raw: DynamicObject? = nil
+    ) {
+        self.rpm = rpm
+        self.targetRpm = targetRpm
+        self.actualRpm = actualRpm
+        self.maxCapacityRpm = maxCapacityRpm
+        self.mode = mode
+        self.raw = raw
+    }
+
+    /// Best reading for the fan's current speed.
+    public var effectiveRpm: Int? {
+        actualRpm ?? rpm
+    }
+
+    /// Hardware minimum RPM from the raw sensor payload when present.
+    public var minCapacityRpm: Int? {
+        raw?.values["min_rpm"]?.intValue
+    }
 
     enum CodingKeys: String, CodingKey {
         case rpm
@@ -1129,6 +1279,7 @@ public struct ThermalFan: Codable, Equatable, Sendable {
         case actualRpm = "actual_rpm"
         case maxCapacityRpm = "max_capacity_rpm"
         case mode
+        case raw
     }
 }
 
@@ -1136,12 +1287,73 @@ public struct ThermalSnapshot: Codable, Equatable, Sendable {
     public var ok: Bool
     public var minRpm: Int?
     public var maxRpm: Int?
+    public var capacityMinRpm: Int?
+    public var capacityMaxRpm: Int?
     public var fans: [ThermalFan]
+
+    public init(
+        ok: Bool,
+        minRpm: Int? = nil,
+        maxRpm: Int? = nil,
+        capacityMinRpm: Int? = nil,
+        capacityMaxRpm: Int? = nil,
+        fans: [ThermalFan] = []
+    ) {
+        self.ok = ok
+        self.minRpm = minRpm
+        self.maxRpm = maxRpm
+        self.capacityMinRpm = capacityMinRpm
+        self.capacityMaxRpm = capacityMaxRpm
+        self.fans = fans
+    }
+
+    /// Parses a server `fan_summary` payload (from `/v1/mtplx/thermal/status`
+    /// or `/health`) into a typed `ThermalSnapshot`.
+    public static func from(fanSummary values: [String: JSONValue]?) -> ThermalSnapshot? {
+        guard let values, !values.isEmpty else { return nil }
+        let ok = values["ok"]?.boolValue ?? false
+        let minRpm = values["min_rpm"]?.intValue
+        let maxRpm = values["max_rpm"]?.intValue
+        let capacityMinRpm = values["capacity_min_rpm"]?.intValue
+        let capacityMaxRpm = values["capacity_max_rpm"]?.intValue
+        var parsedFans: [ThermalFan] = []
+        if case let .array(items)? = values["fans"] {
+            for item in items {
+                guard case let .object(fanDict) = item else { continue }
+                let rawObj: DynamicObject?
+                if case let .object(rawDict)? = fanDict["raw"] {
+                    rawObj = DynamicObject(values: rawDict)
+                } else {
+                    rawObj = nil
+                }
+                parsedFans.append(
+                    ThermalFan(
+                        rpm: fanDict["rpm"]?.intValue,
+                        targetRpm: fanDict["target_rpm"]?.intValue,
+                        actualRpm: fanDict["actual_rpm"]?.intValue,
+                        maxCapacityRpm: fanDict["max_capacity_rpm"]?.intValue ?? rawObj?.values["max_rpm"]?.intValue,
+                        mode: fanDict["mode"]?.stringValue,
+                        raw: rawObj
+                    )
+                )
+            }
+        }
+        return ThermalSnapshot(
+            ok: ok,
+            minRpm: minRpm,
+            maxRpm: maxRpm,
+            capacityMinRpm: capacityMinRpm,
+            capacityMaxRpm: capacityMaxRpm,
+            fans: parsedFans
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case ok
         case minRpm = "min_rpm"
         case maxRpm = "max_rpm"
+        case capacityMinRpm = "capacity_min_rpm"
+        case capacityMaxRpm = "capacity_max_rpm"
         case fans
     }
 }
@@ -1472,6 +1684,8 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var thermal: ThermalSnapshot?
     public var thermalWhenS: Double?
     public var settings: MutableSettings
+    /// Optional server-resolved reasoning effort on the snapshot.
+    public var resolvedReasoningEffort: String?
     public var scheduler: DynamicObject?
     public var machine: MachineInfo
     public var uptimeS: Double
@@ -1519,6 +1733,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case thermal
         case thermalWhenS = "thermal_when_s"
         case settings
+        case resolvedReasoningEffort = "resolved_reasoning_effort"
         case scheduler
         case machine
         case uptimeS = "uptime_s"

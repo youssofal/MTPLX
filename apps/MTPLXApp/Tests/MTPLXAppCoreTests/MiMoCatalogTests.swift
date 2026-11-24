@@ -159,7 +159,17 @@ final class MiMoCatalogTests: XCTestCase {
         }
         let unknown = MTPLXModelOption.recommendedCatalogIDs(for: nil)
         XCTAssertEqual(unknown.firstIndex(of: mimoID).map { $0 + 1 }, unknown.firstIndex(of: nineID))
-        XCTAssertEqual(Array(unknown.suffix(3)), [mimoID, nineID, bonsaiID])
+        XCTAssertEqual(
+            Array(unknown.suffix(6)),
+            [
+                mimoID,
+                nineID,
+                bonsaiID,
+                "inkling2-mini-bare-speed",
+                "inkling2-mini-optimized-speed",
+                "inkling2-mini-optimized-quality",
+            ]
+        )
     }
 
     func testLegacyTierNeverListsMiMo() {

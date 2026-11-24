@@ -18,6 +18,7 @@ public struct ModelLibrary: Equatable, Sendable {
 
     public let primaryDirectory: URL
     public let additionalDirectories: [URL]
+    public let huggingfaceHubCacheDirectory: URL?
 
     public var directories: [URL] {
         [primaryDirectory] + additionalDirectories
@@ -27,7 +28,8 @@ public struct ModelLibrary: Equatable, Sendable {
         primaryDirectory: String,
         additionalDirectories: [String] = [],
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        includeHuggingFaceCache: Bool? = nil
     ) {
         let fallback = Self.defaultPrimaryDirectory(environment: environment)
         let primary = Self.canonicalURL(
@@ -50,6 +52,28 @@ public struct ModelLibrary: Equatable, Sendable {
         }
         self.primaryDirectory = primary
         self.additionalDirectories = extras
+        let disableHF = ["1", "true", "yes", "on"].contains(
+            (environment["MTPLX_DISABLE_HF_HOME_REUSE"] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        )
+        let inXCTest = NSClassFromString("XCTestCase") != nil
+            || environment["XCTestConfigurationFilePath"] != nil
+        let scanHF = !disableHF && (
+            includeHuggingFaceCache ?? (!inXCTest)
+        )
+        if scanHF {
+            let rawHF = SharedModelFolders.huggingfaceHubCacheURL(environment: environment)
+            let canonicalHF = Self.canonicalURL(
+                for: rawHF.path,
+                fallback: rawHF,
+                environment: environment,
+                fileManager: fileManager
+            )
+            self.huggingfaceHubCacheDirectory = seen.contains(canonicalHF.path) ? nil : canonicalHF
+        } else {
+            self.huggingfaceHubCacheDirectory = nil
+        }
     }
 
     public static var `default`: ModelLibrary {
@@ -103,26 +127,144 @@ public struct ModelLibrary: Equatable, Sendable {
 
     public func candidatePaths(for repoID: String) -> [String] {
         let safeName = repoID.replacingOccurrences(of: "/", with: "--")
-        return directories.map {
-            $0.appendingPathComponent(safeName, isDirectory: true).path
+        var paths: [String] = []
+        for root in directories {
+            paths.append(root.appendingPathComponent(safeName, isDirectory: true).path)
+            if let snap = Self.resolveHFSnapshot(repoID: repoID, in: root) {
+                paths.append(snap.path)
+            }
+        }
+        if let hfRoot = huggingfaceHubCacheDirectory,
+           let snap = Self.resolveHFSnapshot(repoID: repoID, in: hfRoot) {
+            paths.append(snap.path)
+        }
+        return paths
+    }
+
+    static func resolveAnyHFSnapshot(
+        inRepoDirectory repoDir: URL,
+        fileManager: FileManager = .default,
+        requireComplete: Bool = true
+    ) -> URL? {
+        let snapshotsDir = repoDir.appendingPathComponent("snapshots", isDirectory: true)
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: snapshotsDir.path, isDirectory: &isDir),
+              isDir.boolValue else { return nil }
+        var ordered: [URL] = []
+        var seen = Set<String>()
+        let refsDir = repoDir.appendingPathComponent("refs", isDirectory: true)
+        if let refFiles = try? fileManager.contentsOfDirectory(
+            at: refsDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            let sortedRefs = refFiles.sorted { a, b in
+                if a.lastPathComponent == "main" { return true }
+                if b.lastPathComponent == "main" { return false }
+                return a.lastPathComponent < b.lastPathComponent
+            }
+            for refFile in sortedRefs {
+                guard let rev = try? String(contentsOf: refFile, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !rev.isEmpty,
+                      !rev.contains("/"),
+                      !rev.contains("\\"),
+                      rev != ".", rev != ".." else { continue }
+                let snap = snapshotsDir.appendingPathComponent(rev, isDirectory: true).standardizedFileURL
+                if seen.insert(snap.path).inserted {
+                    ordered.append(snap)
+                }
+            }
+        }
+        if let snapDirs = try? fileManager.contentsOfDirectory(
+            at: snapshotsDir,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            let byDate = snapDirs.sorted { a, b in
+                let dA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let dB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return dA > dB
+            }
+            for snap in byDate {
+                let std = snap.standardizedFileURL
+                if seen.insert(std.path).inserted {
+                    ordered.append(std)
+                }
+            }
+        }
+        return ordered.first {
+            Self.isAvailable($0, fileManager: fileManager)
+                && (!requireComplete || MTPLXModelOption.hasCompleteInstall(at: $0.path))
         }
     }
 
-    /// Discovers complete direct-child installs in root order. Canonical path
-    /// identity prevents overlapping roots and symlink aliases from duplicating
-    /// one physical model in the picker.
+    public static func resolveHFSnapshot(
+        repoID: String,
+        in hubCache: URL,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let safeName = repoID.replacingOccurrences(of: "/", with: "--")
+        let repoDir = hubCache.appendingPathComponent("models--\(safeName)", isDirectory: true)
+        guard Self.isAvailable(repoDir, fileManager: fileManager) else { return nil }
+        return Self.resolveAnyHFSnapshot(
+            inRepoDirectory: repoDir,
+            fileManager: fileManager,
+            requireComplete: true
+        )
+    }
+
+    static func hfRepoID(fromRepoDirectory repoDir: URL, snapshot: URL) -> String? {
+        let sourceURL = snapshot.appendingPathComponent(".mtplx-source.json")
+        if let data = try? Data(contentsOf: sourceURL),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let recorded = parsed["repo_id"] as? String,
+           recorded.contains("/") {
+            return recorded
+        }
+        let name = repoDir.lastPathComponent
+        guard name.hasPrefix("models--") else { return nil }
+        let rest = String(name.dropFirst("models--".count))
+        guard let sep = rest.range(of: "--") else { return nil }
+        let org = String(rest[..<sep.lowerBound])
+        let repo = String(rest[sep.upperBound...])
+        guard !org.isEmpty, !repo.isEmpty else { return nil }
+        return "\(org)/\(repo)"
+    }
+
+    /// Discovers complete direct-child and HF-cache snapshot installs in root
+    /// order. Canonical path identity prevents overlapping roots and symlink
+    /// aliases from duplicating one physical model in the picker.
     public func discoverCompleteModels(
         fileManager: FileManager = .default
     ) -> [LocalModel] {
         var seen = Set<String>()
         var result: [LocalModel] = []
-        for root in directories {
+        let searchRoots = directories + (huggingfaceHubCacheDirectory.map { [$0] } ?? [])
+        for root in searchRoots {
             guard let children = try? fileManager.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                if child.lastPathComponent.hasPrefix("models--") {
+                    guard let snap = Self.resolveAnyHFSnapshot(inRepoDirectory: child, fileManager: fileManager),
+                          let repoID = Self.hfRepoID(fromRepoDirectory: child, snapshot: snap) else { continue }
+                    let canonical = Self.canonicalURL(for: snap.path, fallback: snap, fileManager: fileManager)
+                    guard seen.insert(canonical.path).inserted,
+                          MTPLXModelOption.hasCompleteInstall(at: canonical.path) else { continue }
+                    let runtimePath = canonical.appendingPathComponent("mtplx_runtime.json").path
+                    let metadata = MTPLXRuntimeMetadata.read(at: runtimePath)
+                    let reference = explicitModelReference(metadata: metadata) ?? repoID
+                    result.append(LocalModel(
+                        path: canonical.path,
+                        reference: reference,
+                        displayName: Self.packDisplayName(in: canonical)
+                            ?? reference.split(separator: "/").last.map(String.init) ?? reference
+                    ))
+                    continue
+                }
                 let canonical = Self.canonicalURL(
                     for: child.path,
                     fallback: child,
@@ -183,18 +325,23 @@ public struct ModelLibrary: Equatable, Sendable {
     /// every build of that source shares, so a 4-bit and a 6-bit build of one
     /// source got one name and one picker row, and an official download was
     /// listed a second time under its base model's name.
-    private func modelReference(
-        metadata: MTPLXRuntimeMetadata?,
-        directoryName: String
-    ) -> String {
+    private func explicitModelReference(
+        metadata: MTPLXRuntimeMetadata?
+    ) -> String? {
         let candidates: [String?] = [
             metadata?.publicModelID,
             metadata?.rawJSON["served_model_id"] as? String,
         ]
-        if let value = candidates.compactMap({ $0 })
+        return candidates.compactMap({ $0 })
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .first(where: { !$0.isEmpty })
-        {
+    }
+
+    private func modelReference(
+        metadata: MTPLXRuntimeMetadata?,
+        directoryName: String
+    ) -> String {
+        if let value = explicitModelReference(metadata: metadata) {
             return value
         }
         return directoryName.replacingOccurrences(of: "--", with: "/")

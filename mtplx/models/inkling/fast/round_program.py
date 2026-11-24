@@ -68,6 +68,101 @@ MAX_PROPOSALS = 7
 _WARM_TRIES = 10
 #: Timed calls per width at load (interleaved across widths; the fastest native one is kept).
 _TIMING_PASSES = 5
+#: Interleaved passes of the standalone native verify step used to calibrate fused-round shares.
+_CALIBRATION_PASSES = 2
+#: Structural fallback (draft_share, verify_forward_share) when load-time calibration is absent.
+_DEFAULT_STAGE_SHARES = (0.22, 0.74)
+_DEFAULT_COMMIT_STAGE_SHARES = (0.20, 0.70)
+
+
+def _clamp_stage_shares(draft_share: float, verify_forward_share: float) -> tuple[float, float]:
+    """Clamp calibrated fused-round stage shares to physically valid, positive bounds.
+
+    Guarantees draft_share > 0, verify_forward_share > 0, and
+    draft_share + verify_forward_share <= 0.98 so verify_time_s >= verify_forward_time_s
+    always holds with positive room for decision/post-eval work.
+    """
+    vf = min(max(float(verify_forward_share), 0.35), 0.90)
+    draft = min(max(float(draft_share), 0.05), 0.60)
+    max_sum = 0.98
+    if draft + vf > max_sum:
+        # Preserve verify_forward predominance while keeping draft strictly positive.
+        draft = max(0.05, min(draft, max_sum - vf))
+        if draft + vf > max_sum:
+            vf = max(0.35, max_sum - draft)
+    return round(draft, 4), round(vf, 4)
+
+
+def _compute_stage_shares(
+    round_ms: float,
+    step_ms: float,
+    *,
+    decide_ms: float | None = None,
+    draft_ms: float | None = None,
+    committed: bool = False,
+) -> tuple[float, float]:
+    """Compute (draft_share, verify_forward_share) for a fused round from measured timings."""
+    if round_ms <= 0 or step_ms <= 0:
+        return _DEFAULT_COMMIT_STAGE_SHARES if committed else _DEFAULT_STAGE_SHARES
+    vf_raw = step_ms / round_ms
+    decide_share = (
+        min(max(decide_ms / round_ms, 0.02), 0.15)
+        if decide_ms is not None and decide_ms > 0
+        else 0.04
+    )
+    commit_share = 0.06 if committed else 0.0
+    draft_raw = 1.0 - vf_raw - decide_share - commit_share
+    # If thermal drift or commit-in-round pushed the remainder outside a plausible band
+    # and standalone draft_ms is available, normalize the measured pieces directly.
+    if (draft_raw < 0.05 or vf_raw > 0.92 or vf_raw < 0.35) and draft_ms is not None and draft_ms > 0:
+        dec = decide_ms if (decide_ms is not None and decide_ms > 0) else 0.04 * round_ms
+        com = 0.06 * round_ms if committed else 0.0
+        total = draft_ms + step_ms + dec + com
+        if total > 0:
+            return _clamp_stage_shares(draft_ms / total, step_ms / total)
+    return _clamp_stage_shares(draft_raw, vf_raw)
+
+
+def stage_shares(rt: Any, proposals: int, *, committed: bool = False) -> tuple[float, float]:
+    """Return calibrated (draft_share, verify_forward_share) for a fused round of ``proposals``.
+
+    Pure O(1) lookup with zero GPU synchronization: reads load-time calibration from
+    ``rt.round_warm["stage_shares"]``, falls back to piece timings in ``rt.round_cost_detail``,
+    and finally to structural defaults when neither ran (e.g. CPU tests or lazy first use).
+    """
+    k = int(proposals)
+    warm = getattr(rt, "round_warm", None)
+    if isinstance(warm, dict):
+        shares_map = warm.get("stage_shares")
+        if isinstance(shares_map, dict) and shares_map:
+            entry = shares_map.get(k) or shares_map.get(str(k))
+            if entry is None:
+                numeric = []
+                for key, val in shares_map.items():
+                    try:
+                        numeric.append((abs(int(key) - k), val))
+                    except (TypeError, ValueError):
+                        continue
+                if numeric:
+                    entry = min(numeric, key=lambda item: item[0])[1]
+            if isinstance(entry, dict) and "draft" in entry and "verify_forward" in entry:
+                return _clamp_stage_shares(entry["draft"], entry["verify_forward"])
+    detail = getattr(rt, "round_cost_detail", None)
+    if isinstance(detail, dict):
+        timing = detail.get("timing")
+        if isinstance(timing, dict):
+            step_map = timing.get("step_ms") or {}
+            draft_map = timing.get("draft_ms") or {}
+            decide_map = timing.get("decide_ms") or {}
+            step_ms = step_map.get(k + 1)
+            draft_ms = draft_map.get(k)
+            if step_ms and draft_ms and step_ms > 0 and draft_ms > 0:
+                decide_ms = float(decide_map.get(k) or 0.0)
+                commit_ms = float(timing.get("commit_observe_ms") or 0.0) if committed else 0.0
+                total = float(draft_ms) + float(step_ms) + max(decide_ms, 0.0) + max(commit_ms, 0.0)
+                if total > 0:
+                    return _clamp_stage_shares(float(draft_ms) / total, float(step_ms) / total)
+    return _DEFAULT_COMMIT_STAGE_SHARES if committed else _DEFAULT_STAGE_SHARES
 
 
 # ------------------------------------------------------------------------------- the site
@@ -477,7 +572,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     from . import draft_table
 
     table = draft_table.bind(drafter, target)       # class B, MTPLX_INKLING_DRAFT_TABLE (off by default)
-    head = target.unembed if table is None else table.head
+    draft_head = drafter.draft_head(target) if hasattr(drafter, "draft_head") else target.unembed
+    head = draft_head if table is None else table.head
     base = None
     if isinstance(head, AffineWeight):
         # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
@@ -756,13 +852,14 @@ class Round:
     stock commit writes that count instead."""
 
     __slots__ = ("block", "rows", "features", "pending", "packet", "native", "route", "committed", "kept",
-                 "emitted", "_rewind")
+                 "emitted", "_rewind", "draft_share", "verify_forward_share")
 
     def __init__(self, block, rows, features, pending, packet, native, route, committed=False, kept=None,
-                 emitted=None, rewind=None):
+                 emitted=None, rewind=None, draft_share=None, verify_forward_share=None):
         self.block, self.rows, self.features, self.pending = block, rows, features, pending
         self.packet, self.native, self.route = packet, native, route
         self.committed, self.kept, self.emitted, self._rewind = committed, kept, emitted, rewind
+        self.draft_share, self.verify_forward_share = draft_share, verify_forward_share
 
     def rewind(self, kept: int) -> None:
         """Undo this round's commit and commit ``kept`` rows the stock way (rare, counted)."""
@@ -935,6 +1032,9 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
                 tuple(model.capture_ids), engine_site.identity(rt))
     if filters is not None or draft_filters is not None:
         geometry += (("filtered", filters is not None, draft_filters is not None),)
+    draft_unembed = getattr(drafter, "draft_unembed", None)
+    if draft_unembed is not None:
+        geometry += (("draft_head", int(draft_unembed.bits), int(draft_unembed.group_size)),)
     n_cap = len(model.capture_ids)
     visits = len(state.local)
     windows = None
@@ -1047,8 +1147,10 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     count(f"round.native.k{k}" if native else f"round.mlx.{route[1]}")
     _note(route[0], route[1], k)
     pending = FastPending(state, deltas, rows)
+    draft_share, verify_forward_share = stage_shares(rt, k, committed=commit)
     if not commit:
-        return Round(block, logits[0], captures, pending, packet, native, route[0])
+        return Round(block, logits[0], captures, pending, packet, native, route[0],
+                     draft_share=draft_share, verify_forward_share=verify_forward_share)
     import numpy as np
 
     kept, emitted = (int(v) for v in np.asarray(outputs[2]).tolist())
@@ -1101,7 +1203,8 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
         rt.commit(cache, captures, FastPending(state, deltas, rows), kept_host, rows)
 
     return Round(block, logits[0], captures, pending, packet, native, route[0], committed=True, kept=kept,
-                 emitted=emitted, rewind=rewind)
+                 emitted=emitted, rewind=rewind, draft_share=draft_share,
+                 verify_forward_share=verify_forward_share)
 
 
 # ------------------------------------------------------------------------------- warm-up
@@ -1130,6 +1233,67 @@ def _synthetic_draft_cache(rt, length: int, seed: int):
     arrays.append(cache[-1][0])
     mx.eval(arrays)
     return cache
+
+
+def _calibrate_stage_shares(rt, live, round_ms, cache, *, length: int, seed: int, temperature: float,
+                            commit: bool) -> dict[int, dict[str, float]]:
+    """Measure standalone native verify-step and decision time once at load to split fused rounds.
+
+    Runs only when the runtime's fast step is installed and synthetic cache is populated;
+    any failure returns {} so model loading is never blocked.
+    """
+    fast_decoder = getattr(rt, "fast", None)
+    if not live or not round_ms or not cache or fast_decoder is None or not callable(getattr(fast_decoder, "step", None)):
+        return {}
+    widths = [k for k in live if round_ms.get(k) and round_ms[k] > 0]
+    if not widths:
+        return {}
+    try:
+        cal_state = DecodeState(rt.model, cache[: rt.trunk_entries])
+        cal_state.prepare()
+        vocab = rt.model.embed_tokens.weight.shape[0]
+        ids_by_k = {
+            k: mx.array([(seed + 104729 * i + k) % vocab for i in range(k + 1)], mx.int32)
+            for k in widths
+        }
+        step_samples: dict[int, list[float]] = {k: [] for k in widths}
+        decide_ms: dict[int, float] = {}
+        for p in range(_CALIBRATION_PASSES):
+            for k in widths:
+                mx.synchronize()
+                t0 = time.perf_counter()
+                logits, captures, deltas = fast_decoder.step(ids_by_k[k], cal_state)
+                mx.eval(logits, captures, [d.arrays() for d in deltas])
+                mx.synchronize()
+                elapsed_ms = (time.perf_counter() - t0) * 1e3
+                if engine_site.last_route().get("route") == "native":
+                    step_samples[k].append(elapsed_ms)
+                if p == 0:
+                    mx.synchronize()
+                    td = time.perf_counter()
+                    pkt = fast_round.decide(logits[0], ids_by_k[k][1:], position=length + 1,
+                                            seed=seed + k, temperature=temperature)
+                    fast_round.read_packet(pkt, k + 1)
+                    mx.synchronize()
+                    decide_ms[k] = (time.perf_counter() - td) * 1e3
+                del logits, captures, deltas
+        shares: dict[int, dict[str, float]] = {}
+        for k in widths:
+            if not step_samples[k]:
+                continue
+            vf_ms = min(step_samples[k])
+            d_share, vf_share = _compute_stage_shares(
+                round_ms[k], vf_ms, decide_ms=decide_ms.get(k), committed=commit,
+            )
+            shares[k] = {
+                "draft": d_share,
+                "verify_forward": vf_share,
+                "decide": round(max(0.0, 1.0 - d_share - vf_share), 4),
+                "verify_forward_ms": _seconds(vf_ms / 1e3) * 1e3,
+            }
+        return shares
+    except Exception:  # noqa: BLE001 - calibration must never block model load
+        return {}
 
 
 def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temperature: float = 1.0,
@@ -1208,8 +1372,16 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
             round_ms[k] = _seconds(min(samples[k]) / 1e3) * 1e3
             report["counts"][k]["round_ms"] = round_ms[k]
             report["counts"][k]["timed_ms"] = [_seconds(v / 1e3) * 1e3 for v in samples[k]]
+    calibrated = _calibrate_stage_shares(
+        rt, live, round_ms, cache, length=length, seed=seed, temperature=temperature, commit=commit,
+    )
+    for k, entry in calibrated.items():
+        if k in report["counts"]:
+            report["counts"][k]["verify_forward_ms"] = entry["verify_forward_ms"]
     del state, cache, target, draft
     report["round_ms"] = round_ms
+    if calibrated:
+        report["stage_shares"] = calibrated
     report["context_tokens"] = length
     report["seconds"] = _seconds(time.perf_counter() - started)
     report["site"] = replay.report()
@@ -1221,4 +1393,4 @@ def _seconds(value: float) -> float:
 
 
 __all__ = ["DraftView", "MAX_PROPOSALS", "NAME", "Round", "draft_inputs", "last_route", "propose",
-           "round_function", "serve", "site", "warm"]
+           "round_function", "serve", "site", "stage_shares", "warm"]

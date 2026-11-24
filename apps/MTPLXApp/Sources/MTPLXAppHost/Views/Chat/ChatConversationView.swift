@@ -30,6 +30,9 @@ final class ChatConversationScrollState {
     var lastAutoScrollAt: ContinuousClock.Instant?
     /// When the frame-change pin last glued the bottom.
     var lastSynchronousPinAt: ContinuousClock.Instant?
+    /// Last document height seen by the pin/scroll path so mid-line
+    /// revisions that did not grow the transcript skip async scroll tasks.
+    var lastObservedDocumentHeight: CGFloat = 0
 
     func cancelTasks() {
         autoScrollTask?.cancel()
@@ -152,7 +155,7 @@ struct ChatConversationView: View {
         }
         .background(Brand.bgOuter)
         .onReceive(viewModel.streamingContentDocument.revisionPublisher) { _ in
-            scrollToBottom()
+            handleStreamingRevisionScroll()
         }
         .onChange(of: viewModel.current?.id) { _, _ in
             handleConversationChange()
@@ -209,10 +212,28 @@ struct ChatConversationView: View {
     private func synchronousBottomPinIfNeeded() {
         guard viewModel.isStreaming,
               scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
+        scroll.lastObservedDocumentHeight = scrollDriver.documentHeight
         if scrollDriver.scrollToBottom(animated: false) {
             scroll.lastSynchronousPinAt = ContinuousClock.now
             viewModel.uiPerfProbe.scrollPinned()
         }
+    }
+
+    /// Lightweight per-revision scroll guard: mid-line character appends
+    /// don't grow document height, and vertical growth already triggers
+    /// `synchronousBottomPinIfNeeded()` inside AppKit's layout pass. Skip
+    /// spawning async scroll tasks unless the document actually grew or
+    /// drifted off the bottom.
+    private func handleStreamingRevisionScroll() {
+        guard scroll.policy.shouldAutoScrollForStreamingUpdate else { return }
+        let currentHeight = scrollDriver.documentHeight
+        let heightGrew = currentHeight > scroll.lastObservedDocumentHeight + 0.5
+        if heightGrew {
+            scroll.lastObservedDocumentHeight = currentHeight
+        } else if !scrollDriver.needsBottomScroll {
+            return
+        }
+        scrollToBottom()
     }
 
     /// A synchronous pin younger than this (the previous frame, at 30 Hz
@@ -329,6 +350,7 @@ struct ChatConversationView: View {
         scroll.autoScrollTask = nil
         scroll.deferredScrollTask = nil
         scroll.finishScrollRepairTask = nil
+        scroll.lastObservedDocumentHeight = 0
         performScrollActions(scroll.policy.didOpenConversation())
         showFullHeavyTranscript = false
         updateRenderPlan(showFullHeavyTranscript: false)
@@ -955,6 +977,32 @@ private final class ChatConversationScrollDriver {
 
     func updateScrollView(_ scrollView: NSScrollView?) {
         self.scrollView = scrollView
+    }
+
+    var documentHeight: CGFloat {
+        scrollView?.documentView?.bounds.height ?? 0
+    }
+
+    var needsBottomScroll: Bool {
+        if userScroll?.isActive == true { return false }
+        guard let scrollView,
+              let documentView = scrollView.documentView else { return false }
+        let clipView = scrollView.contentView
+        let targetY: CGFloat
+        if documentView.isFlipped {
+            targetY = max(documentView.bounds.minY, documentView.bounds.maxY - clipView.bounds.height)
+        } else {
+            targetY = documentView.bounds.minY
+        }
+        let targetRect = clipView.constrainBoundsRect(
+            NSRect(
+                x: clipView.bounds.origin.x,
+                y: targetY,
+                width: clipView.bounds.width,
+                height: clipView.bounds.height
+            )
+        )
+        return abs(clipView.bounds.origin.y - targetRect.origin.y) >= 0.5
     }
 
     @discardableResult

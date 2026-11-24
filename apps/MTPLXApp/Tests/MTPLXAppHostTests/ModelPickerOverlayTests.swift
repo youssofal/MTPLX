@@ -110,6 +110,109 @@ final class ModelPickerOverlayTests: XCTestCase {
         XCTAssertEqual(rows.filter(\.selected).count, 1)
     }
 
+    func testPickingAnotherInklingPackPreservesReasoningSamplerAndFanSettings() {
+        var config = MTPLXAppConfiguration(model: "inkling2-mini-bare-speed")
+        config.fanMode = "max"
+        config.pinFansAtMaxOnStart = true
+        config.temperature = 0.7
+        config.topP = 0.9
+        config.topK = 40
+        config.presencePenalty = 0.2
+        config.reasoning = "off"
+        config.reasoningEffort = "high"
+        config.liveSettingsModelFamily = "inkling2"
+        config.prefillChunkTokens = 4096
+
+        let previous = config.model
+        config.model = "inkling2-mini-optimized-speed"
+        ModelPickerOverlay.normalizeModelScopedDefaults(&config, previousModel: previous)
+
+        XCTAssertEqual(config.liveSettingsModelFamily, "inkling2")
+        XCTAssertEqual(config.reasoning, "off")
+        XCTAssertEqual(config.reasoningEffort, "high")
+        XCTAssertEqual(config.temperature, 0.7)
+        XCTAssertEqual(config.topP, 0.9)
+        XCTAssertEqual(config.topK, 40)
+        XCTAssertEqual(config.presencePenalty, 0.2)
+        XCTAssertEqual(config.prefillChunkTokens, 4096)
+        XCTAssertEqual(config.fanMode, "max")
+        XCTAssertTrue(config.pinFansAtMaxOnStart)
+    }
+
+    func testPickingInklingHealsLegacyNilLiveSettingsFamilyWithoutWipingSettings() {
+        var config = MTPLXAppConfiguration(model: "inkling2-mini-bare-speed")
+        config.fanMode = "max"
+        config.pinFansAtMaxOnStart = true
+        config.temperature = 0.85
+        config.topP = 0.95
+        config.topK = 20
+        config.reasoning = "on"
+        config.reasoningEffort = "medium"
+        config.liveSettingsModelFamily = nil
+        config.prefillChunkTokens = 2048
+
+        let previous = config.model
+        config.model = "inkling2-mini-optimized-quality-fp16"
+        ModelPickerOverlay.normalizeModelScopedDefaults(&config, previousModel: previous)
+
+        XCTAssertEqual(config.liveSettingsModelFamily, "inkling2")
+        XCTAssertEqual(config.reasoning, "on")
+        XCTAssertEqual(config.reasoningEffort, "medium")
+        XCTAssertEqual(config.temperature, 0.85)
+        XCTAssertEqual(config.topP, 0.95)
+        XCTAssertEqual(config.topK, 20)
+        XCTAssertEqual(config.prefillChunkTokens, 2048)
+        XCTAssertEqual(config.fanMode, "max")
+    }
+
+    func testSwitchingFromQwenToInklingStampsInklingFamilyAndKeepsFanMode() {
+        var config = MTPLXAppConfiguration(model: "Youssofal/Qwen3.6-35B-A3B-MTPLX-Speed")
+        config.fanMode = "max"
+        config.pinFansAtMaxOnStart = true
+        config.temperature = 0.6
+        config.topP = 0.95
+        config.topK = 20
+        config.presencePenalty = 0.1
+        config.reasoning = "on"
+        config.reasoningEffort = "high"
+        config.liveSettingsModelFamily = "qwen3_6"
+        config.prefillChunkTokens = 2048
+
+        let previous = config.model
+        config.model = "inkling2-mini-optimized-speed"
+        ModelPickerOverlay.normalizeModelScopedDefaults(&config, previousModel: previous)
+
+        XCTAssertEqual(config.liveSettingsModelFamily, "inkling2")
+        XCTAssertNil(config.reasoning)
+        XCTAssertNil(config.reasoningEffort)
+        XCTAssertNil(config.temperature)
+        XCTAssertNil(config.topP)
+        XCTAssertNil(config.topK)
+        XCTAssertNil(config.presencePenalty)
+        XCTAssertNil(config.prefillChunkTokens)
+        XCTAssertEqual(config.fanMode, "max")
+        XCTAssertTrue(config.pinFansAtMaxOnStart)
+    }
+
+    func testLocalInklingRuntimeMetadataResolvesToInkling2Family() throws {
+        let folder = temporaryDirectory().appendingPathComponent("custom-local-pack", isDirectory: true)
+        try makeCompleteModelFolder(at: folder)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        try """
+        {"model_family": "inkling2", "source_repo": "thinkingmachines/Inkling-2-Mini"}
+        """.write(
+            to: folder.appendingPathComponent("mtplx_runtime.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(MTPLXModelOption.modelFamily(for: folder.path), "inkling2")
+        XCTAssertEqual(MTPLXModelOption.liveSettingsModelFamily(for: folder.path), "inkling2")
+        XCTAssertEqual(MTPLXModelOption.modelFamily(for: "thinkingmachines/Inkling-2-Mini"), "inkling2")
+        XCTAssertEqual(MTPLXModelOption.modelFamily(for: "inkling2_loop"), "inkling2")
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("mtplx-model-picker-tests-\(UUID().uuidString)", isDirectory: true)

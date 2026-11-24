@@ -338,3 +338,321 @@ def test_boundary_refusal_is_counted_in_the_request_log(policy, reason):
         return SimpleNamespace(stats=SimpleNamespace())
 
     assert observe_fast_request(restore, runtime).stats.inkling_fast[f"restore.decline.{reason}"] == 1
+
+
+def test_clone_restored_inkling_turn_preserves_prompt_boundary_logits_for_repeat(monkeypatch):
+    """A clone-restored Inkling turn with zero suffix tokens skips
+    ``_commit_ar_prompt_state`` before decode, so no prompt lease sits beside
+    the answer lease. Carrying ``prompt_boundary_logits`` on
+    ``GenerationFinalState`` and banking it on the generation-final entry keeps
+    a follow-up repeat of the same prompt from declining with
+    ``restore.decline.missing_boundary_logits``."""
+    from mtplx.generation import _restore_near_prefix_prompt_state
+    from mtplx.models.inkling import generation as inkling_gen
+    from mtplx.models.inkling.fast.decoder import observe_fast_request
+    from mtplx.sampling import SamplerConfig
+    from mtplx.server import openai as server
+
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_FAST", "off")
+    monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "8")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "8")
+
+    vocab = 16
+    prompt = list(range(20))
+    prompt_logits = mx.linspace(-1.0, 2.0, vocab, dtype=mx.float32).reshape(1, vocab)
+    mx.eval(prompt_logits)
+    first_token = int(mx.argmax(prompt_logits[0]).item())
+    next_token = (first_token + 3) % vocab
+
+    # Seed the bank as if Turn 1 (session "s1") banked a prompt lease at len(prompt)
+    # and then committed its answer lease (prompt + [101, 102]), keeping both the
+    # prompt-end boundary snapshot and boundary_logits at len(prompt).
+    bank = _bank()
+    seed_cache = _conversation(len(prompt), seed=7)
+    prompt_fields = prompt_lease_fields(
+        seed_cache,
+        committed_mtp_cache=None,
+        hidden=mx.ones((1, 1, 8)),
+        prompt_len=len(prompt),
+        boundaries=[],
+    )
+    bank.put(
+        runtime=RUNTIME,
+        token_ids=prompt,
+        cache=seed_cache,
+        logits=prompt_logits,
+        hidden=mx.ones((1, 1, 8)),
+        hidden_variant="post_norm",
+        session_id="s1",
+        mtp_history_policy="cycle",
+        snapshot_epoch=len(prompt),
+        **prompt_fields,
+    )
+    _decode(seed_cache, 2, seed=200)
+    seed_entry = bank.put(
+        runtime=RUNTIME,
+        token_ids=prompt + [101, 102],
+        cache=seed_cache,
+        logits=mx.zeros((1, vocab), dtype=mx.float32),
+        hidden=mx.ones((1, 1, 8)),
+        hidden_variant="post_norm",
+        keep_live_ref=True,
+        session_id="s1",
+        mtp_history_policy="cycle",
+        snapshot_epoch=len(prompt) + 2,
+    )
+    assert seed_entry is not None
+    assert seed_entry.boundary_logits is not None
+    assert seed_entry.boundary_logits[0] == len(prompt)
+
+    class _ToyTokenizer:
+        eos_token_id = None
+
+        def __init__(self):
+            self._specials: dict[str, int] = {}
+
+        def convert_tokens_to_ids(self, text):
+            return self._specials.setdefault(text, 900 + len(self._specials))
+
+        def decode(self, ids, **_kwargs):
+            return ",".join(str(int(t)) for t in ids)
+
+    class _ToyDrafter:
+        width = 4
+
+        def propose(self, _model, _anchor, _cache, count, **_kwargs):
+            return mx.array([next_token] * count, dtype=mx.int32)
+
+    class _ToyInklingRuntime:
+        model_path = RUNTIME.model_path
+        mtp_enabled = True
+        one_copy_store = True
+        session_restore_uses_bank_boundary = True
+        trunk_entries = 4
+        tokenizer = _ToyTokenizer()
+        drafter = _ToyDrafter()
+        model = SimpleNamespace()
+        contract = SimpleNamespace(
+            base_hidden_variant="post_norm",
+            mtp_hidden_variant="post_norm",
+            mtp_position_mode="cache",
+        )
+        fast = None
+
+        @staticmethod
+        def make_cache():
+            return RUNTIME.make_cache()
+
+        @staticmethod
+        def make_mtp_cache():
+            return []
+
+        @staticmethod
+        def note_session_restore_decline(reason):
+            InklingRuntime.note_session_restore_decline(reason)
+
+        def verify(self, block, _cache):
+            width = len(block) if isinstance(block, list) else int(block.shape[0])
+            rows = mx.full((width, vocab), -10.0, dtype=mx.float32)
+            rows[:, next_token] = 5.0
+            features = [mx.ones((1, width, 8), dtype=mx.float32)]
+            return rows, features, [{}]
+
+        def commit(self, cache, _features, _tapes, kept, _total):
+            _decode(cache, kept, seed=300)
+
+        def forward_ar(self, ids, *, cache, return_hidden=False, **_kwargs):
+            _decode(cache, int(ids.shape[-1]), seed=400)
+            row = mx.full((1, 1, vocab), -10.0, dtype=mx.float32)
+            row[:, :, next_token] = 5.0
+            if return_hidden:
+                return row, mx.ones((1, 1, 8), dtype=mx.float32)
+            return row
+
+    rt = _ToyInklingRuntime()
+    prompt_commits = []
+    real_commit = inkling_gen._commit_ar_prompt_state
+
+    def spy_commit(*args, **kwargs):
+        prompt_commits.append(True)
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(inkling_gen, "_commit_ar_prompt_state", spy_commit)
+
+    # Turn 2: different session ("s2") repeats the identical prompt -> restores via
+    # clone with suffix_tokens == 0, skipping _commit_ar_prompt_state.
+    out = inkling_gen.generate(
+        rt,
+        list(prompt),
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        depth=1,
+        seed=0,
+        stop_token_ids=set(),
+        token_callback=None,
+        prefill_callback=None,
+        session_bank=bank,
+        session_id="s2",
+        session_restore_mode="reference",
+        session_template_hash=None,
+        session_draft_head_identity=None,
+        session_policy_fingerprint=None,
+        capture_final_state=True,
+        commit_prompt_state_to_bank=True,
+        vision_splice=None,
+        constraint=None,
+        abort_check=None,
+        first_token_logprobs_top_k=None,
+        store_prefix_snapshot=False,
+    )
+
+    assert out.stats.session_cache_hit is True
+    assert out.stats.new_prefill_tokens == 0
+    assert str(out.stats.session_restore_mode).endswith("clone")
+    assert prompt_commits == []
+    assert out.tokens == [first_token, next_token]
+    assert out.final_state is not None
+    assert out.final_state.prompt_boundary_logits is not None
+    assert np.array_equal(_bits(out.final_state.prompt_boundary_logits), _bits(prompt_logits))
+
+    # Bank Turn 2's generation-final state through the server's values helper.
+    srv_state = SimpleNamespace(backend_descriptor=SimpleNamespace(backend_id="inkling2_loop"))
+    values = server._generation_final_bank_values(
+        srv_state,
+        out.final_state,
+        prompt_ids=prompt,
+        final_token_ids=prompt + list(out.tokens),
+    )
+    assert "boundary_logits" in values
+    assert values["boundary_logits"][0] == len(prompt)
+    token_ids = values.pop("token_ids")
+    answer_entry = bank.put(
+        runtime=rt,
+        token_ids=token_ids,
+        keep_live_ref=True,
+        session_id="s2",
+        hidden_variant="post_norm",
+        mtp_history_policy="cycle",
+        snapshot_epoch=len(token_ids),
+        **values,
+    )
+    assert answer_entry is not None
+    assert answer_entry.boundary_logits is not None
+    assert answer_entry.boundary_logits[0] == len(prompt)
+    assert np.array_equal(_bits(answer_entry.boundary_logits[1]), _bits(prompt_logits))
+
+    # Drop Turn 1's entry so Turn 3 MUST restore from Turn 2's clone-restored entry.
+    bank._evict_entry(seed_entry, reason="test_force_turn2_entry")
+
+    def repeat_restore(runtime):
+        state = _restore_near_prefix_prompt_state(
+            runtime,
+            prompt,
+            session_bank=bank,
+            base_hidden_variant="post_norm",
+            mtp_hidden_variant="post_norm",
+            mtp_history_policy="cycle",
+            template_hash=None,
+            draft_head_identity=None,
+            policy_fingerprint=None,
+            session_id="s3",
+        )
+        assert state is not None
+        assert state.cached_tokens == len(prompt)
+        assert state.suffix_tokens == 0
+        assert np.array_equal(_bits(state.logits), _bits(prompt_logits))
+        return SimpleNamespace(stats=SimpleNamespace())
+
+    observed = observe_fast_request(repeat_restore, rt)
+    assert observed.stats.inkling_fast.get("restore.decline.missing_boundary_logits", 0) == 0
+
+
+def test_boundary_logits_contract_on_durable_snapshot_and_superseded_lease(monkeypatch):
+    """``SessionBank.put`` keeps supplied ``boundary_logits`` on durable entries,
+    ignores positions without a stored boundary, and never double-counts
+    ``lease_aux_nbytes`` when superseding a matching prompt lease."""
+    from mtplx.server import openai as server
+
+    prompt = list(range(20))
+    answer = prompt + [101, 102]
+    prompt_logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+    mx.eval(prompt_logits)
+
+    # Diverged or non-extended histories produce no boundary_logits.
+    fs = SimpleNamespace(prompt_boundary_logits=prompt_logits)
+    assert server._generation_final_prompt_boundary_logits(
+        fs, prompt_ids=prompt, final_token_ids=prompt
+    ) is None
+    assert server._generation_final_prompt_boundary_logits(
+        fs, prompt_ids=prompt, final_token_ids=[999] + answer[1:]
+    ) is None
+    assert server._generation_final_prompt_boundary_logits(
+        fs, prompt_ids=prompt, final_token_ids=answer
+    ) == (len(prompt), prompt_logits)
+
+    # Durable snapshot entry (copying store): keeps boundary_logits when boundary exists.
+    monkeypatch.setenv("MTPLX_ONE_COPY", "0")
+    bank = _bank()
+    cache = _conversation(len(prompt), seed=11)
+    boundary = snapshot_untrimmable_cache(cache)
+    _decode(cache, 2, seed=21)
+    durable = bank.put(
+        runtime=RUNTIME,
+        token_ids=answer,
+        cache=cache,
+        logits=mx.zeros((1, 16), dtype=mx.float32),
+        hidden=mx.ones((1, 1, 8)),
+        session_id="dur",
+        snapshot_epoch=len(answer),
+        gdn_boundaries=[(len(prompt), boundary, None)],
+        boundary_logits=(len(prompt), prompt_logits),
+    )
+    assert durable is not None and not durable.live_ref_only
+    assert durable.boundary_logits is not None
+    assert durable.boundary_logits[0] == len(prompt)
+    assert np.array_equal(_bits(durable.boundary_logits[1]), _bits(prompt_logits))
+
+    # Without a boundary at that position (unrelated tokens so no donor inherits one),
+    # boundary_logits is ignored.
+    unrelated = [500 + i for i in range(len(answer))]
+    without_boundary = bank.put(
+        runtime=RUNTIME,
+        token_ids=unrelated,
+        cache=cache,
+        logits=mx.zeros((1, 16), dtype=mx.float32),
+        hidden=mx.ones((1, 1, 8)),
+        session_id="dur2",
+        snapshot_epoch=len(unrelated),
+        gdn_boundaries=[],
+        boundary_logits=(len(prompt), prompt_logits),
+    )
+    assert without_boundary is not None and without_boundary.boundary_logits is None
+
+    # One-copy lease superseding a prompt lease: aux bytes count boundary_logits once.
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    bank_a = _bank()
+    bank_b = _bank()
+    cache_a = _conversation(len(prompt), seed=31)
+    cache_b = _conversation(len(prompt), seed=31)
+    for b, c in ((bank_a, cache_a), (bank_b, cache_b)):
+        fields = prompt_lease_fields(
+            c, committed_mtp_cache=None, hidden=mx.ones((1, 1, 8)), prompt_len=len(prompt), boundaries=[]
+        )
+        b.put(
+            runtime=RUNTIME, token_ids=prompt, cache=c, logits=prompt_logits,
+            hidden=mx.ones((1, 1, 8)), session_id="s", snapshot_epoch=len(prompt), **fields,
+        )
+        _decode(c, 2, seed=41)
+    entry_a = bank_a.put(
+        runtime=RUNTIME, token_ids=answer, cache=cache_a, logits=mx.zeros((1, 16), dtype=mx.float32),
+        hidden=mx.ones((1, 1, 8)), keep_live_ref=True, session_id="s", snapshot_epoch=len(answer),
+    )
+    entry_b = bank_b.put(
+        runtime=RUNTIME, token_ids=answer, cache=cache_b, logits=mx.zeros((1, 16), dtype=mx.float32),
+        hidden=mx.ones((1, 1, 8)), keep_live_ref=True, session_id="s", snapshot_epoch=len(answer),
+        boundary_logits=(len(prompt), prompt_logits),
+    )
+    assert entry_a is not None and entry_b is not None
+    assert entry_a.boundary_logits is not None and entry_b.boundary_logits is not None
+    assert entry_a.lease_aux_nbytes == entry_b.lease_aux_nbytes

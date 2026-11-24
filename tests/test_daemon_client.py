@@ -19,6 +19,7 @@ from mtplx import daemon_client
 from mtplx.commands import public
 from mtplx.daemon_client import (
     PORT_APP_DAEMON,
+    PORT_AUTH_REQUIRED,
     PORT_FOREIGN,
     PORT_FREE,
     PORT_MTPLX_SERVER,
@@ -53,6 +54,23 @@ class _StubDaemonHandler(BaseHTTPRequestHandler):
             body = b"<html>definitely not mtplx</html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        required_key = config.get("required_api_key")
+        if required_key and self.headers.get("Authorization") != f"Bearer {required_key}":
+            status = int(config.get("auth_status", 401))
+            body = json.dumps(
+                {
+                    "error": {
+                        "message": "missing or invalid API key",
+                        "type": "authentication_error",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -935,3 +953,168 @@ def test_quickstart_still_bumps_an_unconfigured_default_port(monkeypatch):
     args = SimpleNamespace(host="127.0.0.1", port=8000)
     public._quickstart_autoselect_busy_port(args, target="openwebui", cli_flags=set())
     assert args.port == 8010
+
+
+# ---------- keyed server stop + auth_required classification ----------------
+
+
+def test_classify_port_occupant_distinguishes_401_and_403_from_foreign():
+    for status in (401, 403):
+        with _stub_daemon(
+            {
+                "model": "m",
+                "pid": 4321,
+                "required_api_key": "secret-key",
+                "auth_status": status,
+            }
+        ) as server:
+            port = server.server_address[1]
+            unauthed = classify_port_occupant("127.0.0.1", port)
+            wrong_key = classify_port_occupant("127.0.0.1", port, api_key="wrong")
+            authed = classify_port_occupant("127.0.0.1", port, api_key="secret-key")
+        assert unauthed.kind == PORT_AUTH_REQUIRED
+        assert wrong_key.kind == PORT_AUTH_REQUIRED
+        assert authed.kind == PORT_MTPLX_SERVER
+        assert authed.daemon is not None and authed.daemon.pid == 4321
+
+    with _stub_daemon({"garbage": True}) as server:
+        assert classify_port_occupant("127.0.0.1", server.server_address[1]).kind == PORT_FOREIGN
+
+    advice = port_busy_advice(PortOccupant(kind=PORT_AUTH_REQUIRED), port=8091)
+    joined = " ".join(advice)
+    assert "--api-key-file" in joined and "--api-key" in joined
+
+
+def test_stop_daemon_reports_auth_required_and_stops_when_keyed():
+    with _stub_daemon(
+        {"model": "m", "pid": 9876, "required_api_key": "top-secret"}
+    ) as server:
+        port = server.server_address[1]
+        kills: list[tuple[int, int]] = []
+
+        def fake_kill(pid: int, sig: int) -> None:
+            kills.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError
+
+        unauthed = stop_daemon("127.0.0.1", port, kill=fake_kill, sleep=lambda _s: None)
+        assert unauthed == {"ok": False, "reason": "auth_required", "port": port}
+        assert kills == []
+
+        authed = stop_daemon(
+            "127.0.0.1",
+            port,
+            api_key="top-secret",
+            grace_s=1.0,
+            kill=fake_kill,
+            sleep=lambda _s: None,
+        )
+        assert authed["ok"] is True
+        assert authed["pid"] == 9876
+        assert authed["signal"] == "SIGTERM"
+        assert kills[0] == (9876, signal.SIGTERM)
+
+
+def test_cli_stop_parser_accepts_api_key_and_api_key_file():
+    from mtplx.cli import build_parser
+
+    parser = build_parser()
+    ns_key = parser.parse_args(["stop", "--port", "8091", "--api-key", "abc"])
+    assert ns_key.port == 8091
+    assert ns_key.api_key == "abc"
+    assert ns_key.api_key_file is None
+
+    ns_file = parser.parse_args(["stop", "--port", "8091", "--api-key-file", "/tmp/k"])
+    assert ns_file.port == 8091
+    assert ns_file.api_key_file == "/tmp/k"
+    assert ns_file.api_key is None
+
+
+def test_cmd_stop_public_handles_keyed_server_and_missing_key(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("MTPLX_API_KEY", raising=False)
+    monkeypatch.delenv("MTPLX_AUTH", raising=False)
+    key_file = tmp_path / "api-key"
+    key_file.write_text("file-secret-key\n", encoding="utf-8")
+
+    with _stub_daemon(
+        {"model": "m", "pid": 5555, "required_api_key": "file-secret-key"}
+    ) as server:
+        port = server.server_address[1]
+
+        # (a) Unauthenticated stop on a keyed server reports auth_required (not not_mtplx).
+        rc_unauthed = public.cmd_stop_public(
+            SimpleNamespace(host="127.0.0.1", port=port, json=True)
+        )
+        assert rc_unauthed == 1
+        payload_unauthed = json.loads(capsys.readouterr().out)
+        assert payload_unauthed["ok"] is False
+        assert payload_unauthed["reason"] == "auth_required"
+
+        rc_text = public.cmd_stop_public(
+            SimpleNamespace(host="127.0.0.1", port=port, json=False)
+        )
+        assert rc_text == 1
+        text_out = capsys.readouterr().out
+        assert "--api-key-file" in text_out
+        assert "--api-key" in text_out
+        assert "not by an MTPLX server" not in text_out
+
+        # (b) Stop with --api-key succeeds.
+        stop_calls: list[tuple[int, str | None]] = []
+
+        def fake_stop(host: str, target_port: int, *, grace_s: float = 10.0, api_key: str | None = None):
+            stop_calls.append((target_port, api_key))
+            return stop_daemon(
+                host,
+                target_port,
+                grace_s=grace_s,
+                api_key=api_key,
+                kill=lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError())
+                if sig == 0
+                else None,
+                sleep=lambda _s: None,
+            )
+
+        monkeypatch.setattr("mtplx.daemon_client.stop_daemon", fake_stop)
+        rc_key = public.cmd_stop_public(
+            SimpleNamespace(
+                host="127.0.0.1", port=port, api_key="file-secret-key", json=True
+            )
+        )
+        assert rc_key == 0
+        payload_key = json.loads(capsys.readouterr().out)
+        assert payload_key["ok"] is True
+        assert payload_key["pid"] == 5555
+
+        # (c) Stop with --api-key-file reads key from file and succeeds.
+        rc_file = public.cmd_stop_public(
+            SimpleNamespace(
+                host="127.0.0.1", port=port, api_key_file=str(key_file), json=True
+            )
+        )
+        assert rc_file == 0
+        payload_file = json.loads(capsys.readouterr().out)
+        assert payload_file["ok"] is True
+        assert stop_calls == [(port, "file-secret-key"), (port, "file-secret-key")]
+
+        # (d) Missing --api-key-file fails cleanly without creating the file.
+        missing_file = tmp_path / "does-not-exist"
+        rc_missing = public.cmd_stop_public(
+            SimpleNamespace(
+                host="127.0.0.1", port=port, api_key_file=str(missing_file), json=True
+            )
+        )
+        assert rc_missing == 2
+        assert not missing_file.exists()
+        payload_missing = json.loads(capsys.readouterr().out)
+        assert payload_missing["reason"] == "invalid_api_key"
+
+        # (e) Bare `mtplx stop` (no --port) surfaces auth_required when probed port needs a key.
+        monkeypatch.setattr("mtplx.daemon_client.default_probe_ports", lambda: (port,))
+        rc_bare = public.cmd_stop_public(
+            SimpleNamespace(host="127.0.0.1", port=None, json=True)
+        )
+        assert rc_bare == 1
+        payload_bare = json.loads(capsys.readouterr().out)
+        assert payload_bare["reason"] == "auth_required"
+        assert payload_bare["port"] == port

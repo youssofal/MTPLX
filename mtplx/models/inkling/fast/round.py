@@ -514,11 +514,14 @@ def _kernel(name):
 def wide_decision_enabled():
     """Whether prompt-copy panels of 9 to 32 rows are decided on the GPU (``decide`` with the
     point-mass law the 2- to 8-row copy rounds already use) instead of by the host's seed-match
-    draw. Class B against the host route (each is exact; per-seed tokens differ), so it is off
-    until the lead decides: ``MTPLX_INKLING_WIDE_DECISION=1``."""
+    draw. Class B against the host route (each is exact; per-seed tokens differ); on by default,
+    opt out with ``MTPLX_INKLING_WIDE_DECISION=0``."""
     import os
 
-    return (os.environ.get("MTPLX_INKLING_WIDE_DECISION") or "").strip().lower() in {"1", "on", "true", "yes"}
+    setting = os.environ.get("MTPLX_INKLING_WIDE_DECISION")
+    if setting is None or not setting.strip():
+        return True
+    return setting.strip().lower() in {"1", "on", "true", "yes"}
 
 
 def law_params(rows, temperature=1.0, cap=0.0):

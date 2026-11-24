@@ -1473,6 +1473,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
     ]
 
     /// The 9B-class speed picks on modern chips. MiMo V2.6 Qwen 9B rides
@@ -1815,7 +1818,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("laguna") {
             return "laguna"
         }
-        if normalized.contains("inkling-2-mini") || normalized.contains("inkling2-mini") || normalized.contains("inkling2_loop") {
+        if normalized.contains("inkling-2") || normalized.contains("inkling2") {
             return "inkling2"
         }
         if normalized.contains("glm") {
@@ -1925,7 +1928,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         guard let archID else { return nil }
         let normalized = archID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return nil }
-        if normalized == "inkling2-loop" { return "inkling2" }
+        if normalized.contains("inkling2") || normalized.contains("inkling-2") || normalized.contains("inkling_2") {
+            return "inkling2"
+        }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -1983,7 +1988,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     private static func modelFamilyFromHint(_ raw: String) -> String {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized.contains("inkling2loop") || normalized.contains("inkling2_loop") { return "inkling2" }
+        if normalized.contains("inkling2") || normalized.contains("inkling-2") || normalized.contains("inkling_2") {
+            return "inkling2"
+        }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -2033,6 +2040,20 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if storedFamily.isEmpty || currentFamily.isEmpty { return false }
         if storedFamily == currentFamily { return true }
         return qwenDepthFamily(storedFamily) && qwenDepthFamily(currentFamily)
+    }
+
+    /// Canonical family tag stored in `MTPLXAppConfiguration.liveSettingsModelFamily`.
+    /// Every recognized model family (including `"inkling2"`) owns its own live
+    /// settings scope so picking or reloading within that family preserves
+    /// reasoning, reasoning effort, and sampler preferences.
+    public static func liveSettingsModelFamily(for model: String) -> String? {
+        liveSettingsModelFamily(forFamily: modelFamily(for: model))
+    }
+
+    public static func liveSettingsModelFamily(forFamily family: String) -> String? {
+        let trimmed = family.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "unknown" else { return nil }
+        return trimmed
     }
 
     private static func qwenDepthFamily(_ family: String) -> Bool {

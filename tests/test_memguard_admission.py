@@ -1383,7 +1383,7 @@ class TestReleasedMemoryLeavesTheFootprint:
     0.83 GiB (the steady figure) before and 30 ms after. The per-chunk check stopped a cold 8K read on such a
     reading: the bytes were in neither the pool nor the Mac's free pages."""
 
-    RAM, OTHER_APPS, HOST, ACTIVE = 24 * GIB, int(4.5 * GIB), int(0.83 * GIB), int(15.6 * GIB)
+    RAM, OTHER_APPS, HOST, ACTIVE = 24 * GIB, int(4.7 * GIB), int(0.83 * GIB), int(15.6 * GIB)
 
     def _mac(self, monkeypatch, lingering):
         """``lingering``: footprint beyond the steady host memory at each successive read of the process."""
@@ -1455,7 +1455,7 @@ class TestRefusedBeforeTheStream:
     Mac, Bare Speed, another app holding a 13.7 GB model: HTTP 200, then the admission's 507 as an error event
     15 ms later, no token (`x1-fix-24gb-hog`). Sure: nothing in flight, and the Mac's free memory plus all the engine
     could give back (its pool, its bank, the snapshots queued SSD writes hold) is under the abort floor (here
-    18 GiB wired / 16 = 1.125 GiB) before the request adds a byte."""
+    24 GiB * 2.5% = 0.60 GiB) before the request adds a byte."""
 
     RAM = 24 * GIB
 
@@ -1508,16 +1508,20 @@ class TestRefusedBeforeTheStream:
     def test_everything_the_engine_could_give_back_counts(self, monkeypatch):
         from fastapi import HTTPException
 
-        # 0.3 free + 0.3 pool + 0.3 banked = 0.9 GiB, under 1.125: refused.
-        state, _ = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3)
+        # 0.15 free + 0.15 pool + 0.15 banked = 0.45 GiB, under 0.60: refused.
+        state, _ = self._mac(monkeypatch, available_gib=0.15, pool_gib=0.15, bank_gib=0.15)
         with pytest.raises(HTTPException):
             srv._reject_memory_short_before_stream(state, 300)
-        # 0.3 GiB more held by queued SSD writes, which the admission can cancel: 1.2 GiB, left to the admission.
-        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, queued_gib=0.3)
+        # 0.3 GiB more held by queued SSD writes, which the admission can cancel: 0.75 GiB, left to the admission.
+        state, events = self._mac(
+            monkeypatch, available_gib=0.15, pool_gib=0.15, bank_gib=0.15, queued_gib=0.3
+        )
         assert srv._reject_memory_short_before_stream(state, 300) is None
         assert events == []
         # The idle vision tower an image turn read in, which the admission gives back last: left to it too.
-        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, vision_gib=0.59)
+        state, events = self._mac(
+            monkeypatch, available_gib=0.15, pool_gib=0.15, bank_gib=0.15, vision_gib=0.59
+        )
         assert srv._reject_memory_short_before_stream(state, 300) is None
         assert events == []
 
@@ -1621,7 +1625,7 @@ class TestRefusedBeforeTheStream:
 
         receipts = {}
         for releasable in (False, True):
-            state, manager = self._real(monkeypatch, others_gib=8.7, tower_gib=0.59, releasable=releasable)
+            state, manager = self._real(monkeypatch, others_gib=9.1, tower_gib=0.59, releasable=releasable)
             assert srv._reject_memory_short_before_stream(state, 300) is None
             receipts[releasable] = srv._prefill_admission_shed(
                 state, prompt_ids=list(range(2_000_000, 2_000_300)), session_bank=manager.bank,
@@ -1788,7 +1792,7 @@ class TestPressureLoop:
         assert bank.calls == [(0, "memory_pressure_critical")]
 
     def test_the_sustained_abort_counts_the_engines_pool_as_the_per_chunk_check_does(self, monkeypatch):
-        """A 24 GB Mac mid-read: free pages 0.2 GiB under the 1.25 GiB abort floor, 0.8 GiB in the engine's
+        """A 24 GB Mac mid-read: free pages 0.2 GiB under the 0.60 GiB abort floor, 0.8 GiB in the engine's
         pool, which MLX reuses before it asks the Mac for more. Every chunk's check passes with the pool
         counted; on free pages alone the abort armed after three ticks and stopped the read
         (`x1-fix-24gb-proof2`: a 24K read at its 43rd of 49 chunks). With an empty pool it still arms, and a
@@ -1799,8 +1803,8 @@ class TestPressureLoop:
 
         def short(compressor_gib=1.0, at_s=0.0):
             return sm.SystemMemory(
-                available_bytes=int(1.05 * GIB), total_bytes=24 * GIB, level_percent=4,
-                free_bytes=int(1.05 * GIB), file_backed_bytes=0, wired_bytes=20 * GIB,
+                available_bytes=int(0.40 * GIB), total_bytes=24 * GIB, level_percent=4,
+                free_bytes=int(0.40 * GIB), file_backed_bytes=0, wired_bytes=20 * GIB,
                 compressor_bytes=int(compressor_gib * GIB), swap_used_bytes=0, monotonic_s=at_s,
             )
 

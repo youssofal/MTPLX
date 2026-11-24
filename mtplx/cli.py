@@ -2618,6 +2618,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server port. Omit to find the running server automatically.",
     )
     stop_p.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for stopping a server started with authentication.",
+    )
+    stop_p.add_argument(
+        "--api-key-file",
+        default=None,
+        help="Read the API key from a local file instead of argv/env.",
+    )
+    stop_p.add_argument(
         "--grace-seconds",
         type=float,
         default=10.0,

@@ -22,6 +22,10 @@ struct DecodeChart: View {
 
     var body: some View {
         let rolling = backend.observedCompletionCount > 0 ? backend.rolling : nil
+        let summary = DecodeChartSummary(
+            rolling: rolling,
+            maxRenderedPoints: Self.maxRenderedPoints
+        )
         let motion = !backend.configuration.performanceLock
         let isRunning = backend.daemonState.kind == .running
         let liftAnimation: Animation? = themeStore.reduceMotionPreference
@@ -30,11 +34,11 @@ struct DecodeChart: View {
         let liftDelay: TimeInterval = themeStore.reduceMotionPreference
             ? 0
             : Double(Self.liftStaggerIndex) * Motion.surfaceLiftStaggerStep
-        let points = rolling.map(seriesPoints) ?? []
-        let mean = rolling?.mean
+        let points = summary.points
+        let mean = summary.mean
 
         VStack(alignment: .leading, spacing: 10) {
-            header(rolling: rolling)
+            header(summary: summary)
 
             if points.count >= 2 {
                 Chart {
@@ -62,6 +66,15 @@ struct DecodeChart: View {
                         .foregroundStyle(Brand.chromeAccent)
                         .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
                         .interpolationMethod(.monotone)
+
+                        if points.count <= 24 {
+                            PointMark(
+                                x: .value("sample", idx),
+                                y: .value("TPS", tps)
+                            )
+                            .foregroundStyle(Brand.typeHi)
+                            .symbolSize(24)
+                        }
                     }
 
                     if let mean {
@@ -90,7 +103,7 @@ struct DecodeChart: View {
                 .frame(height: 200)
                 .animation(motion ? .easeOut(duration: 0.30) : nil, value: points.count)
             } else {
-                emptyState
+                emptyState(sampleCount: summary.sampleCount)
             }
         }
         .padding(Brand.Spacing.s4)
@@ -105,42 +118,18 @@ struct DecodeChart: View {
     }
 
     @ViewBuilder
-    private func header(rolling: RollingMetrics?) -> some View {
+    private func header(summary: DecodeChartSummary) -> some View {
         HStack(spacing: 8) {
             Text(tr("DECODE TPS · LAST 5 MIN"))
                 .font(.system(size: 11, weight: .heavy, design: .monospaced))
                 .tracking(3)
                 .foregroundStyle(Brand.textHighlight)
             Spacer()
-            if let r = rolling {
-                Text(tr("%lld samples", r.count))
+            if summary.sampleCount > 0 {
+                Text(tr("%lld turns", summary.sampleCount))
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(Brand.textHighlight.opacity(0.55))
             }
-        }
-    }
-
-    /// Plotted decode series. Prefers the denser `liveHistory`
-    /// (per-tick samples) over the sparse per-request `history` so the
-    /// curve reads as a real trace, and falls back when one is empty.
-    /// The chart plots by sample *index*, not the raw `t` timestamp —
-    /// the old `t`-keyed plot collapsed every point onto one x (and
-    /// rendered as a single vertical bar) whenever the daemon emitted
-    /// identical or zeroed timestamps. Index plotting always spans the
-    /// full width.
-    private func seriesPoints(_ rolling: RollingMetrics) -> [Double] {
-        let live = rolling.liveHistory.map(\.tokS).filter { $0.isFinite && $0 >= 0 }
-        let hist = rolling.history.map(\.tokS).filter { $0.isFinite && $0 >= 0 }
-        let points = live.count > hist.count ? live : hist
-        guard points.count > Self.maxRenderedPoints else { return points }
-        return downsample(points, maxCount: Self.maxRenderedPoints)
-    }
-
-    private func downsample(_ points: [Double], maxCount: Int) -> [Double] {
-        guard maxCount > 1, points.count > maxCount else { return points }
-        let stride = Double(points.count - 1) / Double(maxCount - 1)
-        return (0..<maxCount).map { idx in
-            points[min(points.count - 1, Int((Double(idx) * stride).rounded()))]
         }
     }
 
@@ -152,8 +141,12 @@ struct DecodeChart: View {
     }
 
     @ViewBuilder
-    private var emptyState: some View {
-        Text(tr("Your decode speed history will show here."))
+    private func emptyState(sampleCount: Int) -> some View {
+        Text(
+            sampleCount == 1
+                ? tr("1 completed turn recorded. A second turn starts the 5-minute chart.")
+                : tr("Your decode speed history will show here.")
+        )
             .font(.callout)
             .foregroundStyle(Brand.textHighlight.opacity(0.6))
             .frame(maxWidth: .infinity, minHeight: 160, alignment: .leading)

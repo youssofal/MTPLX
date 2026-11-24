@@ -630,9 +630,10 @@ struct ModelPickerOverlay: View, Equatable {
         errorMessage = nil
         applyingModelID = option.id
         var next = backend.configuration
+        let previousModel = next.model
         next.rememberCustomModel(repoID: option.hfModelID)
         next.model = resolvedReference
-        normalizeModelScopedDefaults(&next)
+        Self.normalizeModelScopedDefaults(&next, previousModel: previousModel)
         Task {
             do {
                 try await backend.applyConfiguration(next, restartIfRunning: true)
@@ -710,9 +711,10 @@ struct ModelPickerOverlay: View, Equatable {
         applyingModelID = option.id
         errorMessage = nil
         var next = backend.configuration
+        let previousModel = next.model
         next.rememberCustomModel(repoID: option.hfModelID)
         next.model = option.resolvedReference
-        normalizeModelScopedDefaults(&next)
+        Self.normalizeModelScopedDefaults(&next, previousModel: previousModel)
         Task {
             do {
                 try await backend.applyConfiguration(next, restartIfRunning: true)
@@ -757,9 +759,10 @@ struct ModelPickerOverlay: View, Equatable {
         applyingModelID = option.id
         errorMessage = nil
         var next = backend.configuration
+        let previousModel = next.model
         next.rememberLocalFolderModel(path: input)
         next.model = option.resolvedReference
-        normalizeModelScopedDefaults(&next)
+        Self.normalizeModelScopedDefaults(&next, previousModel: previousModel)
         Task {
             do {
                 try await backend.applyConfiguration(next, restartIfRunning: true)
@@ -802,31 +805,42 @@ struct ModelPickerOverlay: View, Equatable {
         addLocalFolderModel(input: url.path)
     }
 
-    private func normalizeModelScopedDefaults(_ config: inout MTPLXAppConfiguration) {
+    static func normalizeModelScopedDefaults(
+        _ config: inout MTPLXAppConfiguration,
+        previousModel: String? = nil
+    ) {
         let family = MTPLXModelOption.modelFamily(for: config.model)
+        let canonicalFamily = MTPLXModelOption.liveSettingsModelFamily(forFamily: family)
         let storedFamily = config.liveSettingsModelFamily?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let alreadyCompatible = storedFamily == family
+        let previousFamily = previousModel.map { MTPLXModelOption.modelFamily(for: $0) }
+        let compatibleWithStored = storedFamily.map {
+            MTPLXModelOption.settingsFamiliesCompatible(stored: $0, current: family)
+        } ?? false
+        let compatibleWithPrevious = (storedFamily?.isEmpty ?? true)
+            && previousFamily.map {
+                $0 != "unknown"
+                    && MTPLXModelOption.settingsFamiliesCompatible(stored: $0, current: family)
+            } ?? false
 
-        guard !alreadyCompatible else { return }
+        if compatibleWithStored || compatibleWithPrevious {
+            if let canonicalFamily {
+                config.liveSettingsModelFamily = canonicalFamily
+            }
+            return
+        }
 
         config.temperature = nil
         config.topP = nil
         config.topK = nil
+        config.presencePenalty = nil
         config.reasoning = nil
         config.reasoningEffort = nil
         config.prefillChunkTokens = nil
 
-        switch family {
-        case "qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp", "gemma4", "step":
-            config.generationMode = "mtp"
-            config.loadMTP = true
-            config.liveSettingsModelFamily = family
-        default:
-            config.generationMode = "mtp"
-            config.loadMTP = true
-            config.liveSettingsModelFamily = nil
-        }
+        config.generationMode = "mtp"
+        config.loadMTP = true
+        config.liveSettingsModelFamily = canonicalFamily
     }
 
     private var restartRequired: Bool {
