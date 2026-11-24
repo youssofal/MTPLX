@@ -41,6 +41,7 @@ def _controller(monkeypatch, state, calls):
     monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.2")
     return thermal.SmartFanController(
         restore_delay_s=0,
+        sensorless_delay_s=0,
         activity_probe=lambda: openai_mod.ServerState._smart_fan_activity_probe(state),
     )
 

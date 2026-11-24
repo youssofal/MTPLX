@@ -105,7 +105,7 @@ def test_a_repeat_on_the_model_writes_what_a_first_ask_writes(pack, lane):
 
     again = _answer(rt, bank, question, turn=3)
     assert again.stats.cached_tokens == len(question)
-    assert again.stats.suffix_tokens == 0
+    assert again.stats.new_prefill_tokens == 0
 
     first_ask = _answer(
         rt, SessionBank(max_bytes=1 << 32, per_session_max_bytes=1 << 32), question, turn=3

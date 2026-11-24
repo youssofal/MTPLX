@@ -319,7 +319,9 @@ class Drafter(nn.Module):
             self.output_norm,
             self.cfg["rms_norm_eps"],
         ).astype(dtype)[:, 1 : count + 1]
-        base = linear(h, self.draft_head(target))[..., : self.vocab]
+        draft_head = getattr(self, "draft_head", None)
+        head_weight = draft_head(target) if callable(draft_head) else target.unembed
+        base = linear(h, head_weight)[..., : self.vocab]
         rank = self.cfg["markov_rank"]
         weights = self.markov["rnn_proj.weight"].astype(mx.float32)
         inputs = mx.concatenate([h, mx.broadcast_to(cache[-1][0], h.shape)], axis=-1)

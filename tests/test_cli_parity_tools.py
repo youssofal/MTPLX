@@ -181,7 +181,8 @@ def test_stop_stops_single_discovered_server(monkeypatch, capsys):
     )
     calls: list[tuple] = []
 
-    def fake_stop(host, port, *, grace_s):
+    def fake_stop(host, port, *, grace_s, api_key=None):
+        assert api_key is None
         calls.append((host, port, grace_s))
         return {"ok": True, "pid": 4242, "port": port, "signal": "SIGTERM"}
 
@@ -198,7 +199,7 @@ def test_stop_stops_single_discovered_server(monkeypatch, capsys):
 def test_stop_refuses_foreign_port(monkeypatch, capsys):
     monkeypatch.setattr(
         "mtplx.daemon_client.stop_daemon",
-        lambda host, port, *, grace_s: {"ok": False, "reason": "not_mtplx"},
+        lambda host, port, *, grace_s, api_key=None: {"ok": False, "reason": "not_mtplx"},
     )
     args = SimpleNamespace(host="127.0.0.1", port=9999, grace_seconds=0.1, json=False)
 
