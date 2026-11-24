@@ -6,7 +6,7 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ## [2.13.3] - 2026-11-24
 
-120 Hz ProMotion streaming, 30 Hz zero-churn Performance mode, faster Inkling 2 Mini copy-lane rewrites, M1/M2 long-prefill watchdog split (#422), M5 Ultra Flash-Next `hc_verify_read` (#682), stepped Smart cooling, smaller-Mac memory headroom, Settings/Dashboard/SessionBank truthfulness, Qwen 3.5 retrieval support (#712), and `HF_HOME` model reuse. The full notes: [docs/releases/v2.13.3.md](docs/releases/v2.13.3.md).
+120 Hz streaming, 30 Hz Performance mode, faster Inkling 2 Mini code rewrites, M1/M2 long-prompt stability (#422), M5 Ultra Flash-Next speedup (#682), stepped Smart cooling, smaller-Mac memory headroom, app/settings fixes, Qwen 3.5 embeddings (#712), and local cache reuse. The full notes: [docs/releases/v2.13.3.md](docs/releases/v2.13.3.md).
 
 ## [2.13.2] - 2026-11-23
 
