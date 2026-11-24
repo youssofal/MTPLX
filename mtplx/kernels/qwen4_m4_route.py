@@ -157,6 +157,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from mtplx.compile_state import compiled_step_body
+
 ROWS = 4
 TOP_K = 10
 HIDDEN = 2560
@@ -196,6 +198,7 @@ FUSED_DISPATCHES_PER_LAYER = 2
 
 _LOGITS_KERNEL: Any | None = None
 _TAIL_KERNEL: Any | None = None
+_TAIL_FP16_KERNEL: Any | None = None
 
 
 def router_bytes_per_layer() -> int:
@@ -466,12 +469,14 @@ _TAIL_SOURCE = """
         for (int j = 0; j < TTOPK; ++j) {
             route_scores[gid * TTOPK + j] = picked[j] / total;
         }
+#ifndef ROUTE_TAIL_ONLY
         // unary_ops.h Sigmoid at T = bfloat16_t, exactly as spelled there.
         const bfloat sx = shared_logits[gid];
         auto sigmoid_y = 1 / (1 + metal::exp(metal::abs(sx)));
         shared_factor[gid] = sx < bfloat(0.0f)
             ? bfloat(sigmoid_y)
             : bfloat(1 - sigmoid_y);
+#endif
     }
 """
 
@@ -520,17 +525,7 @@ def _projection_fields(projection: Any, name: str) -> tuple[Any, Any, Any]:
     return weight, scales, biases
 
 
-def check_contract(block: Any, *, index: int) -> None:
-    """Validate the router and shared-gate packs. Raises -- never returns False.
-
-    Everything the two kernels hardcode is checked here: expert count, top-k,
-    the ``norm_topk_prob`` renormalise, and both q8/g64 packs down to dtype and
-    shape. An armed flag on a pack the kernel cannot serve fails at model build
-    with the offending field named, never mid-forward and never by silently
-    reverting to the ten-dispatch scaffold.
-    """
-
-    label = f"MTPLX_QWEN4_ROUTE_KERNEL layer {index}"
+def _check_routing(block: Any, label: str) -> None:
     if int(getattr(block, "num_experts", -1)) != NUM_EXPERTS:
         raise ValueError(
             f"{label}: requires {NUM_EXPERTS} experts, got "
@@ -546,6 +541,20 @@ def check_contract(block: Any, *, index: int) -> None:
             f"{label}: requires top-k probability normalization; the kernel "
             "always renormalises"
         )
+
+
+def check_contract(block: Any, *, index: int) -> None:
+    """Validate the router and shared-gate packs. Raises -- never returns False.
+
+    Everything the two kernels hardcode is checked here: expert count, top-k,
+    the ``norm_topk_prob`` renormalise, and both q8/g64 packs down to dtype and
+    shape. An armed flag on a pack the kernel cannot serve fails at model build
+    with the offending field named, never mid-forward and never by silently
+    reverting to the ten-dispatch scaffold.
+    """
+
+    label = f"MTPLX_QWEN4_ROUTE_KERNEL layer {index}"
+    _check_routing(block, label)
     specs = (
         ("mlp.gate", block.gate, (NUM_EXPERTS, BYTES_PER_ROW // 4)),
         (
@@ -586,6 +595,16 @@ def check_contract(block: Any, *, index: int) -> None:
                 raise ValueError(
                     f"{label}: {name}.{field} dtype {arr.dtype} (want {dtype})"
                 )
+
+
+def _check_tail_contract(block: Any, *, index: int) -> None:
+    label = f"MTPLX_QWEN4_ROUTE_KERNEL_FP16 layer {index}"
+    _check_routing(block, label)
+    scales = getattr(block.gate, "scales", None)
+    if scales is None or scales.dtype != mx.float16:
+        raise ValueError(
+            f"{label}: mlp.gate is not an FP16-scaled quantized projection"
+        )
 
 
 def check_input(x: mx.array) -> None:
@@ -688,6 +707,67 @@ def bind(vec_lanes: int = DEFAULT_VEC_LANES) -> Callable[..., tuple]:
     return route
 
 
+def _bind_tail_fp16() -> Callable[[mx.array], tuple]:
+    global _TAIL_FP16_KERNEL
+    if _TAIL_FP16_KERNEL is None:
+        _TAIL_FP16_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_qwen4_m4_route_tail_fp16",
+            input_names=["logits"],
+            output_names=["expert_ids", "route_scores"],
+            header="#define ROUTE_TAIL_ONLY\n" + _TAIL_HEADER.replace("bfloat", "half"),
+            source=_TAIL_SOURCE.replace("bfloat", "half"),
+            ensure_row_contiguous=True,
+        )
+    tail_grid, tail_threadgroup = tail_geometry()
+
+    def tail(logits):
+        return _TAIL_FP16_KERNEL(
+            inputs=[logits],
+            grid=tail_grid,
+            threadgroup=tail_threadgroup,
+            output_shapes=[(ROWS, TOP_K), (ROWS, TOP_K)],
+            output_dtypes=[mx.uint32, mx.float16],
+        )
+
+    return tail
+
+
+def _check_tail_exact(block: Any, tail: Callable, probes: list, *, index: int) -> None:
+    from mtplx.qwen4_m4_stage3 import _same_bits
+
+    stock = mx.compile(lambda h: block._verify_route(h))
+    fused = mx.compile(lambda h: block._verify_route(h, tail))
+    for x in probes:
+        with compiled_step_body():
+            checks = [_same_bits(want, got) for want, got in zip(stock(x), fused(x))]
+        mx.eval(checks)
+        for name, ok in zip(("expert_ids", "route_scores"), checks):
+            if not ok.item():
+                raise ValueError(
+                    f"MTPLX_QWEN4_ROUTE_KERNEL_FP16 layer {index}: {name} is "
+                    "not bit-exact with the stock routing scaffold"
+                )
+
+
+def install_tail_fp16(inner: Any) -> None:
+    blocks = [layer.mlp for layer in inner.layers]
+    for index, block in enumerate(blocks):
+        _check_tail_contract(block, index=index)
+    tail = _bind_tail_fp16()
+    width = int(inner.args.hidden_size)
+    sample = mx.sin(mx.arange(4 * width, dtype=mx.float32) * 0.0009765625)
+    sample = sample.reshape(1, 4, width)
+    noise = mx.random.normal(sample.shape, key=mx.random.key(0))
+    probes = [
+        rows.astype(mx.float16)
+        for rows in (sample, noise, noise * 0.001, mx.zeros_like(sample))
+    ]
+    for index, block in enumerate(blocks):
+        _check_tail_exact(block, tail, probes, index=index)
+    for block in blocks:
+        block._mtplx_route_tail = tail
+
+
 def stock_route(block: Any, x: mx.array) -> tuple:
     """The ten-dispatch scaffold, isolated, as the kernel's reference.
 
@@ -746,6 +826,7 @@ __all__ = [
     "bind",
     "check_contract",
     "check_input",
+    "install_tail_fp16",
     "logits_geometry",
     "logits_source",
     "metal_order_reference",
