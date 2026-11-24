@@ -97,6 +97,7 @@ struct ChatView: View {
             // Mirror for render leaves that can't take the flag as a
             // parameter (theme closures, NSView viewports).
             ChatRenderPreferences.plainTextOnly = locked
+            chatViewModel.performanceLock = locked
         }
     }
 }

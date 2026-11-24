@@ -441,4 +441,62 @@ final class StreamRenderFlatnessTests: XCTestCase {
             "prose apply+draw grew with document length (line 220: \(late) ms vs line 30: \(early) ms)"
         )
     }
+
+    @MainActor
+    func testPlainTextOnlyRenderModelSkipsCodeCardsAndRendersRawMarkdownLiterals() {
+        let store = StreamingDocumentStore(mode: .plainLines)
+        let model = StreamingRichRenderModel(document: store, plainTextOnly: true)
+        var surfaces: [Int: (StreamingProseNSView, StreamingProseTextSurface.Coordinator)] = [:]
+
+        for line in 1...200 {
+            if line == 1 {
+                store.append("# Heading `code`\n")
+            } else if line == 10 {
+                store.append("```swift\n")
+            } else if line == 25 {
+                store.append("```\n")
+            } else {
+                store.append("Line \(line) with **bold** and `inline` literal text\n")
+            }
+            for item in model.latestItems {
+                if case let .prose(id, blocks) = item {
+                    let pair = surfaces[id] ?? {
+                        let v = StreamingProseNSView(frame: NSRect(x: 0, y: 0, width: 548, height: 1200))
+                        v.layout()
+                        let c = StreamingProseTextSurface.Coordinator()
+                        surfaces[id] = (v, c)
+                        return (v, c)
+                    }()
+                    StreamingProseTextSurface.apply(
+                        blocks: blocks,
+                        to: pair.0,
+                        coordinator: pair.1,
+                        plainTextOnly: true
+                    )
+                }
+            }
+        }
+
+        XCTAssertFalse(model.latestItems.isEmpty)
+        for item in model.latestItems {
+            switch item {
+            case .prose:
+                break
+            case .openCode, .closedCode, .plain, .settled:
+                XCTFail("plainTextOnly render model must emit .prose items only, got \(item)")
+            }
+        }
+        XCTAssertLessThanOrEqual(
+            model.itemsPublishCount,
+            6,
+            "plainTextOnly AppKit routing must keep SwiftUI items publishes bounded (<= 6 across 200 lines)"
+        )
+
+        let combinedRendered = surfaces.keys.sorted()
+            .compactMap { surfaces[$0]?.0.textStorage.string }
+            .joined(separator: "\n")
+        XCTAssertTrue(combinedRendered.contains("# Heading `code`"))
+        XCTAssertTrue(combinedRendered.contains("```swift"))
+        XCTAssertTrue(combinedRendered.contains("**bold**"))
+    }
 }

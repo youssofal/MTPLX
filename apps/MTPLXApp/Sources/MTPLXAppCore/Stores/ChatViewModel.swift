@@ -229,6 +229,12 @@ public final class ChatViewModel: ObservableObject {
     /// what the header chip shows after a turn finishes, surviving a
     /// switch away and back.
     private var heldDecodeReadings: [UUID: HeadlineDecodeReading] = [:]
+    public var performanceLock: Bool = false {
+        didSet {
+            guard performanceLock != oldValue else { return }
+            updateStreamDisplayLinkFrameRate()
+        }
+    }
     private var streamFlushTask: Task<Void, Never>?
     private var streamDisplayLink: CADisplayLink?
     private let streamDisplayLinkTarget = StreamFlushLinkTarget()
@@ -236,6 +242,7 @@ public final class ChatViewModel: ObservableObject {
     // e.g. unit tests). The live reveal is display-link driven at native
     // screen refresh rate (up to 120 Hz on ProMotion); see ensureStreamFlushLoop.
     private static let streamFlushInterval: Duration = .milliseconds(16)
+    private static let performanceLockStreamFlushInterval: Duration = .milliseconds(33)
     /// Hard bound on how far a coalescing buffer may run ahead of its
     /// document if the display link ever stalls (freeze backstop). Sized
     /// at 4 KB so high-TPS (300+ tok/s) copy-lane bursts stay strictly
@@ -1343,12 +1350,29 @@ public final class ChatViewModel: ObservableObject {
 
     /// Native refresh-rate range for the streaming reveal display link.
     /// Uses the screen's full ProMotion ceiling (120 Hz on ProMotion Macs,
-    /// 60 Hz on standard panels) so high-TPS streams paint every vsync.
+    /// Native display-link rate range: `30 Hz` when Performance mode is on
+    /// (`performanceLock`) to reduce WindowServer Metal compositing overhead
+    /// alongside MLX decode; otherwise native ProMotion (`60–120 Hz` on
+    /// supported displays, `60 Hz` on standard panels) so high-TPS streams
+    /// paint every vsync.
     static func preferredDisplayLinkFrameRateRange(
-        maximumFramesPerSecond: Int
+        maximumFramesPerSecond: Int,
+        performanceLock: Bool = false
     ) -> CAFrameRateRange {
+        if performanceLock {
+            return CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
+        }
         let maxFPS = Float(max(60, maximumFramesPerSecond))
         return CAFrameRateRange(minimum: 60, maximum: maxFPS, preferred: maxFPS)
+    }
+
+    private func updateStreamDisplayLinkFrameRate() {
+        guard let link = streamDisplayLink else { return }
+        let maxFPS = (NSScreen.main ?? NSScreen.screens.first)?.maximumFramesPerSecond ?? 60
+        link.preferredFrameRateRange = Self.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: maxFPS,
+            performanceLock: performanceLock
+        )
     }
 
     /// One shared reveal loop drives EVERY in-flight turn stream (the
@@ -1357,10 +1381,11 @@ public final class ChatViewModel: ObservableObject {
     private func ensureStreamFlushLoop() {
         guard streamDisplayLink == nil, streamFlushTask == nil else { return }
         // Reveal on the DISPLAY clock at the screen's native refresh rate
-        // (120 Hz on ProMotion Macs, 60 Hz on standard displays). A display
-        // link in .common modes wakes exactly once per painted frame so
-        // reveal cadence and paint cadence stay locked without coalescing
-        // under SoC load or starving during scroll-tracking runloop modes.
+        // (120 Hz on ProMotion Macs, 60 Hz on standard displays, or 30 Hz
+        // when Performance mode is active). A display link in .common modes
+        // wakes once per target frame so reveal cadence and paint cadence
+        // stay locked without coalescing under SoC load or starving during
+        // scroll-tracking runloop modes.
         if let screen = NSScreen.main ?? NSScreen.screens.first {
             streamDisplayLinkTarget.onTick = { [weak self] in
                 self?.flushLiveTurnStreams()
@@ -1370,7 +1395,8 @@ public final class ChatViewModel: ObservableObject {
                 selector: #selector(StreamFlushLinkTarget.tick(_:))
             )
             link.preferredFrameRateRange = Self.preferredDisplayLinkFrameRateRange(
-                maximumFramesPerSecond: screen.maximumFramesPerSecond
+                maximumFramesPerSecond: screen.maximumFramesPerSecond,
+                performanceLock: performanceLock
             )
             link.add(to: .main, forMode: .common)
             streamDisplayLink = link
@@ -1379,8 +1405,11 @@ public final class ChatViewModel: ObservableObject {
         // Headless fallback (no attached display; unit tests).
         streamFlushTask = Task { [weak self] in
             while !Task.isCancelled {
+                let interval = (self?.performanceLock == true)
+                    ? Self.performanceLockStreamFlushInterval
+                    : Self.streamFlushInterval
                 do {
-                    try await Task.sleep(for: Self.streamFlushInterval)
+                    try await Task.sleep(for: interval)
                 } catch {
                     return
                 }

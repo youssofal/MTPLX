@@ -154,6 +154,45 @@ enum StreamingProseMarkdownFormatter {
         return result
     }
 
+    /// Formats a document block as literal plain text for Performance mode,
+    /// skipping Markdown delimiter scanning and syntax styling while keeping
+    /// merged-segment UTF-16 lengths exact for frozen-merge reconciliation.
+    static func formatPlainBlock(_ text: String) -> NSAttributedString {
+        guard text.contains("\n") else {
+            return formatPlainLine(text)
+        }
+        let result = NSMutableAttributedString()
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        for (index, rawLine) in lines.enumerated() {
+            if index > 0 {
+                result.append(separatorNewline)
+            }
+            result.append(formatPlainLine(String(rawLine)))
+        }
+        return result
+    }
+
+    private static func formatPlainLine(_ rawLine: String) -> NSAttributedString {
+        if rawLine.isEmpty {
+            return NSAttributedString(
+                string: " ",
+                attributes: [
+                    .font: blankFont,
+                    .foregroundColor: typeHiColor,
+                    .paragraphStyle: blankParagraphStyle,
+                ]
+            )
+        }
+        return NSAttributedString(
+            string: rawLine,
+            attributes: [
+                .font: bodyFont,
+                .foregroundColor: typeHiColor,
+                .paragraphStyle: bodyParagraphStyle,
+            ]
+        )
+    }
+
     static func formatLine(_ rawLine: String, finalized: Bool) -> NSAttributedString {
         if finalized, let cached = finalizedLineCache.object(forKey: rawLine as NSString) {
             return cached
@@ -868,6 +907,7 @@ final class StreamingProseNSView: NSView {
 struct StreamingProseTextSurface: NSViewRepresentable {
     let renderModel: StreamingRichRenderModel
     let proseID: Int
+    var plainTextOnly: Bool = false
 
     @MainActor
     final class Coordinator {
@@ -881,21 +921,26 @@ struct StreamingProseTextSurface: NSViewRepresentable {
         weak var surface: StreamingProseNSView?
         var renderModel: StreamingRichRenderModel?
         var proseID: Int?
+        var plainTextOnly: Bool = false
         var applied: [AppliedBlock] = []
         var itemsCancellable: AnyCancellable?
 
         func attach(
             renderModel: StreamingRichRenderModel,
             proseID: Int,
+            plainTextOnly: Bool = false,
             surface: StreamingProseNSView
         ) {
             let surfaceChanged = self.surface !== surface
             self.surface = surface
-            let sameSource = self.renderModel === renderModel && self.proseID == proseID
+            let sameSource = self.renderModel === renderModel
+                && self.proseID == proseID
+                && self.plainTextOnly == plainTextOnly
             if !sameSource || surfaceChanged {
                 itemsCancellable?.cancel()
                 self.renderModel = renderModel
                 self.proseID = proseID
+                self.plainTextOnly = plainTextOnly
                 applied.removeAll(keepingCapacity: true)
                 itemsCancellable = renderModel.perRevision.sink { [weak self] items in
                     self?.refresh(items: items)
@@ -912,7 +957,8 @@ struct StreamingProseTextSurface: NSViewRepresentable {
                     StreamingProseTextSurface.apply(
                         blocks: blocks,
                         to: surface,
-                        coordinator: self
+                        coordinator: self,
+                        plainTextOnly: plainTextOnly
                     )
                 }
                 return
@@ -928,6 +974,7 @@ struct StreamingProseTextSurface: NSViewRepresentable {
         context.coordinator.attach(
             renderModel: renderModel,
             proseID: proseID,
+            plainTextOnly: plainTextOnly,
             surface: surface
         )
         return surface
@@ -937,6 +984,7 @@ struct StreamingProseTextSurface: NSViewRepresentable {
         context.coordinator.attach(
             renderModel: renderModel,
             proseID: proseID,
+            plainTextOnly: plainTextOnly,
             surface: surface
         )
     }
@@ -961,7 +1009,8 @@ struct StreamingProseTextSurface: NSViewRepresentable {
     static func apply(
         blocks: [StreamingDocumentBlock],
         to surface: StreamingProseNSView,
-        coordinator: Coordinator
+        coordinator: Coordinator,
+        plainTextOnly: Bool = false
     ) {
         reconcileFrozenMerges(blocks: blocks, coordinator: coordinator)
 
@@ -993,10 +1042,12 @@ struct StreamingProseTextSurface: NSViewRepresentable {
             if hasSeparator {
                 suffix.append(StreamingProseMarkdownFormatter.separatorNewline)
             }
-            let formatted = StreamingProseMarkdownFormatter.formatBlock(
-                block.text,
-                finalized: block.finalized
-            )
+            let formatted = plainTextOnly
+                ? StreamingProseMarkdownFormatter.formatPlainBlock(block.text)
+                : StreamingProseMarkdownFormatter.formatBlock(
+                    block.text,
+                    finalized: block.finalized
+                )
             suffix.append(formatted)
             nextApplied.append(Coordinator.AppliedBlock(
                 id: block.id,

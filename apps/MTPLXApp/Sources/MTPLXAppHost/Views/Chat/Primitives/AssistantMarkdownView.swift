@@ -721,20 +721,12 @@ struct StreamingAssistantMarkdownView: View {
     var plainTextOnly: Bool = false
 
     var body: some View {
-        Group {
-            if plainTextOnly {
-                StreamingPlainDocumentView(
-                    document: document,
-                    fallbackText: fallbackText
-                )
-            } else {
-                StreamingRichDocumentView(
-                    document: document,
-                    fallbackText: fallbackText
-                )
-                .id(ObjectIdentifier(document))
-            }
-        }
+        StreamingRichDocumentView(
+            document: document,
+            fallbackText: fallbackText,
+            plainTextOnly: plainTextOnly
+        )
+        .id("\(ObjectIdentifier(document))-\(plainTextOnly)")
         .frame(maxWidth: .infinity, alignment: .leading)
         .transaction { tx in
             tx.animation = nil
@@ -762,22 +754,37 @@ struct StreamingAssistantMarkdownView: View {
     /// roles. One linear pass per body evaluation; per-line highlight
     /// states are threaded through the cached lexer (dictionary hits
     /// for every already-frozen line, one real lex for a new line).
+    /// In Performance mode (`plainTextOnly`), fence classification and syntax
+    /// lexing are skipped so everything streams through bounded `.prose`
+    /// AppKit surfaces.
     @MainActor
     static func renderItems(
         for blocks: [StreamingDocumentBlock],
-        lexChain: StreamingFenceLexChain? = nil
+        lexChain: StreamingFenceLexChain? = nil,
+        plainTextOnly: Bool = false
     ) -> [StreamingRenderItem] {
         UIStreamPerfProbe.renderTimed(.renderItems, size: blocks.count) {
-            deriveItems(for: blocks[...], lexChain: lexChain).map(\.item)
+            deriveItems(
+                for: blocks[...],
+                lexChain: lexChain,
+                plainTextOnly: plainTextOnly
+            ).map(\.item)
         }
     }
 
     @MainActor
     static func deriveItems(
         for blocks: ArraySlice<StreamingDocumentBlock>,
-        lexChain: StreamingFenceLexChain? = nil
+        lexChain: StreamingFenceLexChain? = nil,
+        plainTextOnly: Bool = false
     ) -> [DerivedRenderItem] {
         guard !blocks.isEmpty else { return [] }
+        if plainTextOnly {
+            var derived: [DerivedRenderItem] = []
+            derived.reserveCapacity(4)
+            appendProseRun(blocks, closedByFinalizedFence: false, into: &derived)
+            return derived
+        }
         // Consumes the fence counts stamped on the blocks at
         // construction — recounting text here was O(document) per frame.
         let classification = StreamingMarkdownBlockSafety.classifyRoles(blocks)
@@ -976,27 +983,6 @@ struct StreamingAssistantMarkdownView: View {
     }
 }
 
-/// Performance Lock deliberately retains the simple observed SwiftUI path.
-/// It has no syntax/TextKit work, so direct block publication is cheap and
-/// its semantics stay exactly as before.
-private struct StreamingPlainDocumentView: View {
-    @ObservedObject var document: StreamingDocumentStore
-    let fallbackText: String
-
-    var body: some View {
-        if document.blocks.isEmpty {
-            StreamingPlainTextView(text: fallbackText)
-        } else {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(document.blocks) { block in
-                    StreamingPlainBlockView(block: block)
-                        .equatable()
-                }
-            }
-        }
-    }
-}
-
 /// Publishes SwiftUI structure changes only. While an open code fence grows,
 /// its TextKit bridge listens to the document directly; characters no longer
 /// invalidate the entire SwiftUI transcript 30-60 times per second. We still
@@ -1027,6 +1013,7 @@ final class StreamingRichRenderModel: ObservableObject {
     let perRevision = PassthroughSubject<[StreamingRenderItem], Never>()
 
     private let document: StreamingDocumentStore
+    let plainTextOnly: Bool
     private let lexChain = StreamingFenceLexChain()
     private var revisionCancellable: AnyCancellable?
 
@@ -1045,8 +1032,9 @@ final class StreamingRichRenderModel: ObservableObject {
     /// (also forwarded to `UIStreamPerfProbe.noteSwiftUIItemsPublished()`).
     private(set) var itemsPublishCount = 0
 
-    init(document: StreamingDocumentStore) {
+    init(document: StreamingDocumentStore, plainTextOnly: Bool = false) {
         self.document = document
+        self.plainTextOnly = plainTextOnly
         refresh(force: true)
         revisionCancellable = document.revisionPublisher.sink { [weak self] _ in
             self?.refresh()
@@ -1069,7 +1057,8 @@ final class StreamingRichRenderModel: ObservableObject {
             let derivedSuffix = UIStreamPerfProbe.renderTimed(.renderItems, size: suffix.count) {
                 StreamingAssistantMarkdownView.deriveItems(
                     for: suffix,
-                    lexChain: lexChain
+                    lexChain: lexChain,
+                    plainTextOnly: plainTextOnly
                 )
             }
             var combined = frozenItems
@@ -1084,7 +1073,8 @@ final class StreamingRichRenderModel: ObservableObject {
             let derivedAll = UIStreamPerfProbe.renderTimed(.renderItems, size: blocks.count) {
                 StreamingAssistantMarkdownView.deriveItems(
                     for: blocks[...],
-                    lexChain: lexChain
+                    lexChain: lexChain,
+                    plainTextOnly: plainTextOnly
                 )
             }
             advanceFrozenPrefix(from: derivedAll, in: blocks, mergeCount: mergeCount)
@@ -1191,13 +1181,22 @@ final class StreamingRichRenderModel: ObservableObject {
 private struct StreamingRichDocumentView: View {
     let document: StreamingDocumentStore
     let fallbackText: String
+    let plainTextOnly: Bool
     @StateObject private var renderModel: StreamingRichRenderModel
 
-    init(document: StreamingDocumentStore, fallbackText: String) {
+    init(
+        document: StreamingDocumentStore,
+        fallbackText: String,
+        plainTextOnly: Bool = false
+    ) {
         self.document = document
         self.fallbackText = fallbackText
+        self.plainTextOnly = plainTextOnly
         _renderModel = StateObject(
-            wrappedValue: StreamingRichRenderModel(document: document)
+            wrappedValue: StreamingRichRenderModel(
+                document: document,
+                plainTextOnly: plainTextOnly
+            )
         )
     }
 
@@ -1228,7 +1227,8 @@ private struct StreamingRichDocumentView: View {
         case .prose(let id, _):
             StreamingProseChunkView(
                 id: id,
-                renderModel: renderModel
+                renderModel: renderModel,
+                plainTextOnly: plainTextOnly
             )
             .equatable()
         case .openCode(let id, let language, _):
@@ -1250,15 +1250,17 @@ private struct StreamingRichDocumentView: View {
 private struct StreamingProseChunkView: View, Equatable {
     let id: Int
     let renderModel: StreamingRichRenderModel
+    let plainTextOnly: Bool
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.id == rhs.id && lhs.renderModel === rhs.renderModel
+        lhs.id == rhs.id && lhs.renderModel === rhs.renderModel && lhs.plainTextOnly == rhs.plainTextOnly
     }
 
     var body: some View {
         StreamingProseTextSurface(
             renderModel: renderModel,
-            proseID: id
+            proseID: id,
+            plainTextOnly: plainTextOnly
         )
         .frame(maxWidth: .infinity, alignment: .leading)
     }

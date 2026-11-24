@@ -407,6 +407,25 @@ final class StreamingPerfRegressionTests: XCTestCase {
     }
 
     @MainActor
+    func testDisplayLinkFrameRateRangeCapsAt30HzInPerformanceMode() {
+        let locked = ChatViewModel.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: 120,
+            performanceLock: true
+        )
+        XCTAssertEqual(locked.minimum, 15)
+        XCTAssertEqual(locked.maximum, 30)
+        XCTAssertEqual(locked.preferred, 30)
+
+        let unlocked = ChatViewModel.preferredDisplayLinkFrameRateRange(
+            maximumFramesPerSecond: 120,
+            performanceLock: false
+        )
+        XCTAssertEqual(unlocked.minimum, 60)
+        XCTAssertEqual(unlocked.maximum, 120)
+        XCTAssertEqual(unlocked.preferred, 120)
+    }
+
+    @MainActor
     func testPacer120HzHighTPSRampStaysLagBoundedAndSmooth() {
         // Simulate a 120 Hz ProMotion display where generation starts at
         // ~80 tok/s (~320 chars/s) for 0.6 s, then suddenly accelerates to
