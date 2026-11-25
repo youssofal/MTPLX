@@ -4237,13 +4237,14 @@ class SessionBank:
             extra_state=_clone_tree(entry.extra_state),
         )
 
+    def _expired(self, entry: SessionBankEntry, now: float) -> bool:
+        """Idle past ``idle_ttl_s``: the next lookup or restore drops it."""
+
+        return now - float(entry.last_access_s) > self.idle_ttl_s
+
     def _purge_expired(self) -> None:
         now = time.time()
-        expired = [
-            entry
-            for entry in self._entries.values()
-            if now - float(entry.last_access_s) > self.idle_ttl_s
-        ]
+        expired = [entry for entry in self._entries.values() if self._expired(entry, now)]
         for entry in expired:
             self._evict_entry(entry, reason=CacheMissReason.EVICTED.value)
 
@@ -4800,6 +4801,10 @@ class SessionBank:
         longest block-rounded common prefix: a longer recurrent entry with
         no usable boundary displaced the valid shorter exact prefix, which
         the release then evicted (the 2026-09-27 review's reproduction).
+
+        An entry idle past ``idle_ttl_s`` is never a source: ``restore`` and
+        the near-prefix lookup purge expired entries before matching, so the
+        restore cannot read it.
         """
 
         keys: set[tuple[int, ...]] = set()
@@ -4829,7 +4834,17 @@ class SessionBank:
                 plan["source"] = entry
                 plan["mode"] = mode
 
-        exact = self.longest_prefix(tokens)
+        now = time.time()
+        live = [
+            entry for entry in list(self._entries.values()) if not self._expired(entry, now)
+        ]
+        exact: SessionBankEntry | None = None
+        for entry in live:
+            prefix = entry.token_ids
+            if len(prefix) > len(tokens) or tokens[: len(prefix)] != prefix:
+                continue
+            if exact is None or len(prefix) > len(exact.token_ids):
+                exact = entry
         exact_len = int(exact.prefix_len) if exact is not None else 0
         exact_serves = (
             exact is not None
@@ -4842,7 +4857,7 @@ class SessionBank:
             return plan
         knobs = _near_prefix_knobs()
         matches: list[tuple[SessionBankEntry, int]] = []
-        for entry in list(self._entries.values()):
+        for entry in live:
             candidate = _near_prefix_candidate_len(
                 entry, tokens, allow_block_prefix=True, **knobs
             )

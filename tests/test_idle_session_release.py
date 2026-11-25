@@ -288,6 +288,53 @@ class TestRestoreSource:
         entry.cache_ref = None
         assert bank.restore_plan(tuple(range(20)))["keys"] == set()
 
+    def test_an_expired_entry_is_not_a_source(self):
+        """A conversation idle past ``idle_ttl_s`` that shares a block
+        prefix with the prompt: the restore purges it before matching, so
+        the plan must not protect it."""
+
+        bank = _bank(max_bytes=10**9, per_session_max_bytes=10**9, idle_ttl_s=3_600.0)
+        shared = tuple(range(1_000))
+        entry = _put(bank, shared + (5, 5), session_id="old", nbytes=900, live_cache=True)
+        prompt = shared + (7, 7)
+        assert bank.restore_source_keys(prompt) == {entry.token_ids}
+        entry.last_access_s -= 3_601.0
+        plan = bank.restore_plan(prompt)
+        assert plan["keys"] == set()
+        assert plan["reuse_tokens"] == 0
+        assert plan["source"] is None
+        # Planning is read-only; the release takes it like any idle entry.
+        assert _keys(bank) == {entry.token_ids}
+        receipt = bank.release_sessions(None, keep_session_ids={"new"}, protect_tokens=prompt)
+        assert receipt["protected_restore_source_tokens"] is None
+        assert _keys(bank) == set()
+
+    def test_an_expired_near_source_leaves_the_live_exact_prefix(self):
+        """The shape of the kept-recurrent test above, with the longer entry
+        expired: the plan falls back to the live exact prefix alone."""
+
+        bank = _bank(max_bytes=10**9, per_session_max_bytes=10**9, idle_ttl_s=3_600.0)
+        prompt = tuple(range(1_500))
+        longer = _put(
+            bank, prompt[:1_000] + tuple(range(9_000, 9_020)), session_id="conv", nbytes=900
+        )
+        longer.has_recurrent = True
+        longer.gdn_boundaries = [(768, None, None)]
+        exact = _put(bank, prompt[:256], session_id="other", nbytes=100)
+        assert bank.restore_plan(prompt)["source"] is longer
+        longer.last_access_s -= 3_601.0
+        plan = bank.restore_plan(prompt)
+        assert plan["keys"] == {exact.token_ids}
+        assert plan["source"] is exact
+        assert plan["reuse_tokens"] == 256
+
+    def test_an_expired_exact_prefix_is_not_a_source(self):
+        bank = _bank(idle_ttl_s=3_600.0)
+        entry = _put(bank, tuple(range(10)), session_id="conv", nbytes=100)
+        assert bank.restore_plan(tuple(range(20)))["keys"] == {entry.token_ids}
+        entry.last_access_s -= 3_601.0
+        assert bank.restore_plan(tuple(range(20)))["keys"] == set()
+
     def test_the_admission_walk_no_longer_protects_a_one_token_overlap(self):
         """Old rule: the entry with the greatest common prefix was protected
         even when that prefix was one token; shrink_for_admission(0) then
