@@ -306,6 +306,7 @@ def decode(decoder, ids, state, stages, spec):
 def _synthetic_cache(rt, length: int, seed: int):
     """A trunk cache at ``length`` committed tokens with random contents, in the decode
     layout (window rings of the window size, global banks of one capacity step)."""
+    from ..cache import Q8BankCache, pack_rows
     from .state import BANK_STEP, round_up
 
     model = rt.model
@@ -324,6 +325,10 @@ def _synthetic_cache(rt, length: int, seed: int):
         key, k1, k2 = mx.random.split(key, 3)
         kv.keys = (mx.random.normal((1, heads, rows, head_dim), key=k1) * 0.5).astype(dtype)
         kv.values = (mx.random.normal((1, heads, rows, head_dim), key=k2) * 0.5).astype(dtype)
+        if type(kv) is Q8BankCache:
+            # ``--kv-quant q8``: the bank layout requests serve (packed rows), so warm-up records
+            # and times the programs that replay, on ``attend_q8``.
+            kv.keys, kv.values = pack_rows(kv.keys), pack_rows(kv.values)
         kv.offset = length
         if layer.sliding:
             # The ring form DecodeState.prepare leaves: the slot after the newest row.

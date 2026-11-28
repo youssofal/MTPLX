@@ -978,6 +978,10 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     more takes ``attend_c`` (class C: matrix-unit products in a fixed order, bounded rounding
     against RC6; every width, so the one-token step and the verify rows share one law).
     """
+    if not window and keys.dtype == mx.uint8:
+        # An 8-bit global bank (``--kv-quant q8``): only the class C order reads packed rows.
+        return attend_q8(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+                         rel_basis, window=False)
     if not window and attend_c_enabled() and q.dtype == mx.bfloat16 and keys.shape[2] >= ATTEND_C_FROM:
         return attend_c(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
                         rel_basis, window=False)
@@ -1343,6 +1347,126 @@ def attend_c(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, new
     groups = -(-qblocks // per_group)
     chains = nch * KV_HEADS * 8 * qblocks       # [chunk][kv head][query of the head, padded]
     po, pm, pl = _kernel("mtplx_inkling_fast_attend_partials_c", _PARTIALS_C, "#include <metal_simdgroup_matrix>\n")(
+        inputs=[q, keys, values, k_rows, v_rows, prof, pos_a, count_a, newest_a],
+        template=[("T", dtype), ("WINDOW", False), ("CHUNK", CHUNK), ("SCALE", SCALE_BITS), ("QB", per_group)],
+        grid=(32 * per_group * nch, KV_HEADS, groups),
+        threadgroup=(32 * per_group, 1, 1),
+        output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    (hg,) = _kernel("mtplx_inkling_fast_attend_merge_c", _MERGE_C)(
+        inputs=[po, pm, pl, sink, gate_logits, pos_a, count_a],
+        template=[("T", dtype), ("WINDOW", False), ("CHUNK", CHUNK)],
+        grid=(128 * HEADS, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(1, rows, HEADS * HEAD_DIM)],
+        output_dtypes=[dtype],
+    )
+    return hg
+
+
+# ----------------------------------------------------------------------------------------
+# 8-bit global banks (``--kv-quant q8``, ``inkling.cache.Q8BankCache``).
+#
+# A global visit's committed rows are packed rows (``cache.pack_rows``): 128 bytes of
+# ``mx.quantize(group_size=64, bits=8)`` values, then each group's bf16 scale and bias.
+# ``attend_q8`` is ``attend_c`` with one change: a committed row's 16-byte piece of 8 dims is
+# loaded as its 8 bytes and its group's scale and bias, and rebuilt in the tile as
+# ``bf16(q * scale + bias)``, the same value ``mx.dequantize`` gives. The panel's own rows
+# stay bf16. So for the same bank, ``attend_q8(packed)`` equals ``attend_c(unpack_rows(packed))``
+# bit for bit, and inherits class C's bound against RC6, its row stability and its
+# independence from the bank's capacity.
+# ----------------------------------------------------------------------------------------
+
+def _q8_source():
+    src = _PARTIALS_C
+    edits = [
+        ("    const device T* kg = kc + size_t(g) * kc_strides[1];\n"
+         "    const device T* vg = vc + size_t(g) * vc_strides[1];\n",
+         "    const device uint8_t* kg = kc + size_t(g) * kc_strides[1];\n"
+         "    const device uint8_t* vg = vc + size_t(g) * vc_strides[1];\n"),
+        ("    uint4 pre[PER];\n",
+         "    uint4 pre[PER];\n"
+         "    bool pq[PER];                              // piece u is a packed committed row\n"),
+        ("        pre[u] = uint4(0);                                                                \\\n",
+         "        pre[u] = uint4(0);                                                                \\\n"
+         "        pq[u] = false;                                                                    \\\n"),
+        ("                const device T* src;                                                      \\\n"
+         "                if (p < pos0) {                                                           \\\n"
+         "                    int slot = p;                                                         \\\n"
+         "                    if (WINDOW) { slot = nw - (pos0 - 1 - p); if (slot < 0) slot += cap; } \\\n"
+         "                    src = (is_v ? vg : kg) + size_t(slot) * (is_v ? vc_strides[2] : kc_strides[2]); \\\n"
+         "                } else {                                                                  \\\n"
+         "                    src = (is_v ? vrg : krg) + size_t(p - pos0) * (is_v ? vr_strides[2] : kr_strides[2]); \\\n"
+         "                }                                                                         \\\n"
+         "                pre[u] = *(const device uint4*)(src + 8 * part);                          \\\n",
+         "                if (p < pos0) {                                                           \\\n"
+         "                    const device uint8_t* row = (is_v ? vg : kg)                          \\\n"
+         "                        + size_t(p) * size_t(is_v ? vc_strides[2] : kc_strides[2]);       \\\n"
+         "                    const uint2 b8 = *(const device uint2*)(row + 8 * part);              \\\n"
+         "                    const uint sb = *(const device uint*)(row + 128 + 4 * (part >> 3));   \\\n"
+         "                    pre[u] = uint4(b8.x, b8.y, sb, 0u);                                   \\\n"
+         "                    pq[u] = true;                                                         \\\n"
+         "                } else {                                                                  \\\n"
+         "                    const device T* src = (is_v ? vrg : krg)                              \\\n"
+         "                        + size_t(p - pos0) * (is_v ? vr_strides[2] : kr_strides[2]);      \\\n"
+         "                    pre[u] = *(const device uint4*)(src + 8 * part);                      \\\n"
+         "                }                                                                         \\\n"),
+        ("                const uint4 w = pre[u];\n"
+         "                dst[0] = as_type<float>(w.x << 16); dst[1] = as_type<float>(w.x & 0xffff0000u);\n"
+         "                dst[2] = as_type<float>(w.y << 16); dst[3] = as_type<float>(w.y & 0xffff0000u);\n"
+         "                dst[4] = as_type<float>(w.z << 16); dst[5] = as_type<float>(w.z & 0xffff0000u);\n"
+         "                dst[6] = as_type<float>(w.w << 16); dst[7] = as_type<float>(w.w & 0xffff0000u);\n",
+         "                const uint4 w = pre[u];\n"
+         "                if (pq[u]) {\n"
+         "                    #pragma clang fp contract(off)\n"
+         "                    const float s = as_type<float>(w.z << 16), bias = as_type<float>(w.z & 0xffff0000u);\n"
+         "                    for (int j = 0; j < 8; ++j) {\n"
+         "                        const uint byte = ((j < 4 ? w.x : w.y) >> (8 * (j & 3))) & 0xffu;\n"
+         "                        const float scaled = float(byte) * s;\n"
+         "                        dst[j] = static_cast<float>(static_cast<T>(scaled + bias));\n"
+         "                    }\n"
+         "                } else {\n"
+         "                dst[0] = as_type<float>(w.x << 16); dst[1] = as_type<float>(w.x & 0xffff0000u);\n"
+         "                dst[2] = as_type<float>(w.y << 16); dst[3] = as_type<float>(w.y & 0xffff0000u);\n"
+         "                dst[4] = as_type<float>(w.z << 16); dst[5] = as_type<float>(w.z & 0xffff0000u);\n"
+         "                dst[6] = as_type<float>(w.w << 16); dst[7] = as_type<float>(w.w & 0xffff0000u);\n"
+         "                }\n"),
+    ]
+    for old, new in edits:
+        if src.count(old) != 1:
+            raise RuntimeError(f"attend_q8: the class C source changed ({src.count(old)} matches for {old[:60]!r})")
+        src = src.replace(old, new)
+    return src
+
+
+_PARTIALS_Q8 = _q8_source()
+_INPUTS["mtplx_inkling_fast_attend_partials_q8"] = _INPUTS["mtplx_inkling_fast_attend_partials_c"]
+_OUTPUTS["mtplx_inkling_fast_attend_partials_q8"] = _OUTPUTS["mtplx_inkling_fast_attend_partials_c"]
+
+
+def attend_q8(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+              rel_basis, *, window=False):
+    """``attend_c`` for a global visit whose bank holds packed 8-bit rows: same inputs and output,
+    ``keys``/``values`` ``uint8 (1, 8, CAP, 136)``; equal to ``attend_c`` on the unpacked bank."""
+    if window:
+        raise NotImplementedError("attend_q8 serves global visits; window rings stay bf16")
+    rows = q.shape[1]
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
+    dtype = q.dtype
+    if dtype != mx.bfloat16:
+        raise ValueError("attend_q8 rebuilds bf16 rows")
+    if keys.dtype != mx.uint8 or values.dtype != mx.uint8 or keys.shape[3] != HEAD_DIM + 8:
+        raise ValueError(f"attend_q8 reads packed rows (uint8, {HEAD_DIM + 8} bytes), got {keys.dtype} {keys.shape}")
+    prof = profiles(rel, rel_basis)
+    pos_a, count_a, newest_a = _u32(pos), _u32(count), _u32(newest)
+    nch = -(-(keys.shape[2] + 32) // CHUNK)
+    qblocks = -(-(GROUP * rows) // 8)
+    per_group = min(qblocks, 3)
+    groups = -(-qblocks // per_group)
+    chains = nch * KV_HEADS * 8 * qblocks
+    po, pm, pl = _kernel("mtplx_inkling_fast_attend_partials_q8", _PARTIALS_Q8, "#include <metal_simdgroup_matrix>\n")(
         inputs=[q, keys, values, k_rows, v_rows, prof, pos_a, count_a, newest_a],
         template=[("T", dtype), ("WINDOW", False), ("CHUNK", CHUNK), ("SCALE", SCALE_BITS), ("QB", per_group)],
         grid=(32 * per_group * nch, KV_HEADS, groups),

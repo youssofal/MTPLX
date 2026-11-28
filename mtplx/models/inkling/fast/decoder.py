@@ -26,9 +26,9 @@ from __future__ import annotations
 import os
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache
 
-from ..cache import WindowCache
+from ..cache import WindowCache, is_global_bank
 # First: the engine's compiled module loads before the weights and before any Metal kernel.
 from . import engine_site
 from .routes import count, fast_route_counts, request_receipt
@@ -81,6 +81,11 @@ def round_commit_enabled():
     the stock commit writes the kept rows (candidate 7's served A/B, same seeds and rounds:
     the committing round was not faster warm and slower cold). The served loop and the
     load's warm-up read the same switch, so the load warms the variant that serves."""
+    from ..cache import q8_enabled
+
+    if q8_enabled():
+        # 8-bit global banks: the program decides and the host commit packs the kept rows.
+        return False
     return os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "off").strip().lower() not in ("0", "off", "false", "no")
 
 
@@ -128,8 +133,8 @@ class FastDecoder:
             return "cache"
         for visit, layer in enumerate(self.model.visit_order):
             kv, conv = cache[2 * visit], cache[2 * visit + 1]
-            want = WindowCache if self.model.layers[layer].sliding else KVCache
-            if type(kv) is not want or not isinstance(conv, ArraysCache) or kv.keys is None:
+            sliding = self.model.layers[layer].sliding
+            if (type(kv) is not WindowCache if sliding else not is_global_bank(kv)) or not isinstance(conv, ArraysCache) or kv.keys is None:
                 return "layout"
             if getattr(kv, "keys", None) is not None and kv.keys.shape[0] != 1:
                 return "batch"

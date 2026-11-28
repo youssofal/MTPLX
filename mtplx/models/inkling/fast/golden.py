@@ -68,6 +68,10 @@ def state_tensors(state, visit):
     else:
         keys, values, count = state.global_view(visit)
         keys, values = keys[:, :, : max(1, state.length)], values[:, :, : max(1, state.length)]
+        if keys.dtype == mx.uint8:
+            from ..cache import unpack_rows
+
+            keys, values = unpack_rows(keys), unpack_rows(values)
         out["state.count"] = count
     out.update({"state.keys": keys, "state.values": values})
     for slot in range(4):

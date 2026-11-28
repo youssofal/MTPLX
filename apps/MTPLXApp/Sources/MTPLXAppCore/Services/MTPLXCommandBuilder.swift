@@ -1082,9 +1082,12 @@ struct ResolvedDaemonArgs {
 
     private static func modelAllowsPagedKVQuantization(_ model: String) -> Bool {
         // Same qwen3_next attention layout for 3.5 / 3.6 / 3.8; the server's
-        // kv_quant_policy declares q8/q4 supported for all three.
+        // kv_quant_policy declares q8/q4 supported for all three. Inkling 2
+        // Mini's policy declares q8 for its global visits (the server keeps
+        // its own gate, so a mode the policy lacks still downgrades to off).
         let family = MTPLXModelOption.modelFamily(for: model)
         return family == "qwen3_5" || family == "qwen3_6" || family == "qwen3_8"
+            || family == "inkling2"
     }
 
     private static func normalizedReasoning(_ raw: String?) -> String? {

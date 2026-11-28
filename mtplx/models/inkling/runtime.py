@@ -87,6 +87,10 @@ class InklingRuntime(MTPLXRuntime):
 
     def __init__(self, path: Path, *, mtp: bool, contract=None):
         model, vision, config = load_target(path)
+        from .cache import settle_kv_quant_for_pack
+
+        # Before the footprint: the caches and the session identity read the mode.
+        settle_kv_quant_for_pack(model.embed_tokens.weight.dtype)
         prompt_flash.set_model_dtype(model.embed_tokens.weight.dtype)   # the type the width rule's proof checks
         # M1 to M4: the plain form's first-use proofs, here before ready; the width rule only reads their verdicts.
         self.prompt_flash_proof = prompt_flash.prove_at_load()
@@ -272,8 +276,12 @@ class InklingRuntime(MTPLXRuntime):
         """The global banks' rounding up to a whole capacity step: one step a global visit."""
         from .fast.state import BANK_STEP
 
+        from .cache import packed_width, q8_enabled
+
         cfg = self.model.config
         row = 2 * cfg["num_key_value_heads"] * cfg["head_dim"] * self.model.embed_tokens.weight.dtype.size
+        if q8_enabled():
+            row = 2 * cfg["num_key_value_heads"] * packed_width(cfg["head_dim"])  # packed 8-bit rows
         globals_ = sum(1 for i in self.model.visit_order if not self.model.layers[i].sliding)
         return globals_ * BANK_STEP * row
 
@@ -491,6 +499,9 @@ class InklingRuntime(MTPLXRuntime):
         blocks = self.drafter.blocks if self.drafter else ()
         draft = ((self.trunk_entries + i, block.window) for i, block in enumerate(blocks))
         expected_offset = str(tokens)
+        from .cache import q8_enabled
+
+        packed = q8_enabled()
         for slot, window in chain(target, draft):
             if slot >= len(snapshot.states) or slot >= len(snapshot.meta_states):
                 self.note_session_restore_decline("snapshot_layout")
@@ -507,6 +518,11 @@ class InklingRuntime(MTPLXRuntime):
                 )
             if not aligned:
                 self.note_session_restore_decline("snapshot_length")
+                return False
+            if not window and any((v.dtype == mx.uint8) != (packed and slot < self.trunk_entries) for v in state):
+                # A snapshot saved with the other ``--kv-quant`` setting: its global rows are
+                # packed 8-bit where this cache wants bf16, or the reverse.
+                self.note_session_restore_decline("kv_quant_layout")
                 return False
         return True
 

@@ -1336,7 +1336,10 @@ def short_prompt(keys, width=None):
 
 
 def _bank_bytes(kv, rows, cfg, dtype):
-    """What :func:`reserve_bank` allocates for this chunk of a global visit (0 where it does not)."""
+    """What :func:`reserve_bank` allocates for this chunk of a global visit (0 where it does not);
+    for an 8-bit bank, the bf16 copy of the history the launch reads."""
+    if _packed_bank(kv):
+        return 2 * (kv.offset + rows) * cfg["num_key_value_heads"] * cfg["head_dim"] * dtype.size
     keys = kv.keys
     need = kv.offset + rows
     if keys is not None and need <= keys.shape[2]:
@@ -1370,6 +1373,12 @@ def select_call(keys):
     if not fits_route(EXTRA_PEAK_BYTES):
         return "memory"
     return None
+
+
+def _packed_bank(kv):
+    from ..cache import Q8BankCache
+
+    return type(kv) is Q8BankCache
 
 
 def stage(layer, query, k_rows, v_rows, profiles, sink, kv):
@@ -1407,6 +1416,11 @@ def stage(layer, query, k_rows, v_rows, profiles, sink, kv):
     if layer.sliding:
         keys, values = window_update(kv, k_rows, v_rows)
         keys, values = kv._temporal_order(keys), kv._temporal_order(values)
+    elif _packed_bank(kv):
+        # An 8-bit global bank (``cache.Q8BankCache``, ``--kv-quant q8``): the chunk is stored as
+        # packed rows in the bank ``size_global_banks`` already sized for the prompt, and the
+        # launch reads the history unpacked to bf16 (one visit's copy at a time).
+        keys, values = kv.update_and_fetch(k_rows, v_rows)
     else:
         reserve_bank(kv, k_rows)
         keys, values = kv.update_and_fetch(k_rows, v_rows)

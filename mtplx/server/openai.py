@@ -1561,6 +1561,18 @@ def _template_hash(tokenizer: Any) -> str:
     return hash_text(str(template))
 
 
+def _session_identity_hash(runtime: Any, template_hash: str | None) -> str | None:
+    """The session bank's identity hash: the template hash, salted with the KV layout where a
+    model's saved KV rows depend on ``--kv-quant`` (Inkling's 8-bit global banks hold packed rows).
+    A snapshot then restores only into a cache of its own layout, from RAM or from the SSD tier,
+    in both directions; ``off`` keeps the plain template hash, so existing snapshots still match."""
+    if template_hash is None or getattr(runtime, "backend_id", None) != "inkling2_loop":
+        return template_hash
+    from mtplx.models.inkling.cache import q8_enabled
+
+    return hash_text(f"{template_hash}|inkling_kv=q8") if q8_enabled() else template_hash
+
+
 def _array_bytes(value: Any) -> bytes:
     if value is None:
         return b""
@@ -4014,11 +4026,14 @@ class ServerState:
             )
         )
         self.template_hash = (
-            self.model_scheduler.submit_foreground(
-                _template_hash,
-                self.runtime.tokenizer,
-                batch_key="startup.template_hash",
-            ).result()
+            _session_identity_hash(
+                self.runtime,
+                self.model_scheduler.submit_foreground(
+                    _template_hash,
+                    self.runtime.tokenizer,
+                    batch_key="startup.template_hash",
+                ).result(),
+            )
             if self.runtime is not None
             else None
         )
@@ -20291,6 +20306,16 @@ def _health_inkling_attention_payload(state: Any) -> dict[str, Any]:
     return {}
 
 
+def _inkling_kv_quantization() -> str:
+    """``q8`` where the global visits' banks hold packed 8-bit rows (``inkling.cache.q8_enabled``)."""
+    try:
+        from mtplx.models.inkling.cache import q8_enabled
+
+        return "q8" if q8_enabled() else "off"
+    except Exception:  # noqa: BLE001 - health must answer
+        return "off"
+
+
 def _health_inkling_cache_payload(state: Any) -> dict[str, Any]:
     if getattr(getattr(state, "runtime", None), "backend_id", None) != "inkling2_loop":
         return {}
@@ -20298,7 +20323,7 @@ def _health_inkling_cache_payload(state: Any) -> dict[str, Any]:
         "ssd_session_snapshots_enabled": getattr(state, "session_bank_cold_tier", None) is not None,
         "active_ssd_kv": False,
         "active_paged_kv": False,
-        "active_kv_quantization": "off",
+        "active_kv_quantization": _inkling_kv_quantization(),
         "active_kv_layout": "resident_global_kv_and_chronological_local_rings",
         "active_ssd_kv_reason": "ssd_tier_restores_session_boundaries",
         "active_paged_kv_reason": "inkling_relative_sink_attention_reads_chronological_keys_and_values",

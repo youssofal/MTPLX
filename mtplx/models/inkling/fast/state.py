@@ -139,8 +139,9 @@ class DecodeState:
                 self._make_ring(kv)
                 changed.append(visit)
             if not local and kv.keys is None:
-                shape = (1, self.heads, BANK_STEP, self.head_dim)
-                kv.keys, kv.values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+                dtype, width = self._bank_layout(kv)
+                shape = (1, self.heads, BANK_STEP, width)
+                kv.keys, kv.values = mx.zeros(shape, dtype), mx.zeros(shape, dtype)
                 changed.append(visit)
             elif not local and kv.keys.shape[2] % BANK_STEP:
                 # A prefill leaves 256-row steps and a restore the exact length: one copy into
@@ -151,6 +152,15 @@ class DecodeState:
                 if conv[slot] is None:
                     conv[slot] = mx.zeros((1, self.keep, width), mx.float32)
         return changed
+
+    def _bank_layout(self, kv):
+        """``(dtype, last dimension)`` of a global visit's bank: bf16 rows, or packed 8-bit rows
+        for a ``Q8BankCache`` (``--kv-quant q8``)."""
+        from ..cache import Q8BankCache, packed_width
+
+        if type(kv) is Q8BankCache:
+            return mx.uint8, packed_width(self.head_dim)
+        return self.dtype, self.head_dim
 
     def _is_ring(self, kv):
         if kv.keys is None or kv.keys.shape[2] != self.window or kv.keep:
@@ -207,6 +217,10 @@ class DecodeState:
             keys, values = mx.take(kv.keys, index, axis=2), mx.take(kv.values, index, axis=2)
         else:
             keys, values = kv.keys[:, :, : self.length], kv.values[:, :, : self.length]
+            if keys.dtype == mx.uint8:
+                from ..cache import unpack_rows
+
+                keys, values = unpack_rows(keys, k_rows.dtype), unpack_rows(values, v_rows.dtype)
         return mx.concatenate([keys, k_rows], axis=2), mx.concatenate([values, v_rows], axis=2)
 
     # ------------------------------------------------------------------ commit
@@ -222,7 +236,14 @@ class DecodeState:
         for visit, delta in enumerate(deltas):
             kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
             keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
-            if write is not None and (kv.keys.dtype != keys.dtype or kv.keys.ndim != 4):
+            packed = not self.local[visit] and kv.keys.dtype == mx.uint8
+            if packed:
+                # An 8-bit global bank: the kept rows as packed rows, written by slice update
+                # (the native row writer moves 16-bit payloads only).
+                from ..cache import pack_rows
+
+                keys, values = pack_rows(keys), pack_rows(values)
+            elif write is not None and (kv.keys.dtype != keys.dtype or kv.keys.ndim != 4):
                 write = None
             if self.local[visit]:
                 # At most two contiguous runs of ring slots: static slice updates, in place
@@ -252,7 +273,7 @@ class DecodeState:
             else:
                 if end > kv.keys.shape[2]:
                     self._grow(kv, end)
-                if write is not None:
+                if write is not None and not packed:
                     at = offsets.get(("bank", self.length))
                     if at is None:
                         at = offsets[("bank", self.length)] = mx.array(self.length, mx.int32)
@@ -280,8 +301,8 @@ class DecodeState:
 
     def _grow(self, kv, end):
         cap = round_up(end, BANK_STEP)
-        shape = (1, self.heads, cap, self.head_dim)
-        keys, values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+        shape = (1, self.heads, cap, kv.keys.shape[3])
+        keys, values = mx.zeros(shape, kv.keys.dtype), mx.zeros(shape, kv.values.dtype)
         keys[:, :, : self.length, :] = kv.keys[:, :, : self.length, :]
         values[:, :, : self.length, :] = kv.values[:, :, : self.length, :]
         # Evaluated here, one visit at a time: the old bank is released before the next visit

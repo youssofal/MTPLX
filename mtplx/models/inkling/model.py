@@ -684,12 +684,15 @@ class Model(nn.Module):
             raise ValueError(f"Unrecognized Inkling target tensors: {sorted(weights)}")
 
     def make_cache(self):
+        from .cache import Q8BankCache, q8_enabled
+
+        bank = Q8BankCache if q8_enabled() else KVCache
         cache = []
         for index in self.visit_order:
             kv = (
                 WindowCache(max_size=self.config["sliding_window_size"])
                 if self.layers[index].sliding
-                else KVCache()
+                else bank()
             )
             cache.extend((kv, ArraysCache(4)))
         return cache
