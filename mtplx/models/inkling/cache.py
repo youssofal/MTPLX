@@ -9,6 +9,63 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 _PROMPT_ROWS: contextvars.ContextVar = contextvars.ContextVar("inkling_prompt_rows", default=None)
 
+#: 8-bit global KV (``--kv-quant q8``): each row of a global visit's bank is a packed row of
+#: ``mx.quantize(group_size=64, bits=8)`` values (``head_dim`` bytes) followed by each group's bf16
+#: scale and bias (4 bytes a group): 136 bytes for 128 dimensions, 53% of a bf16 row.
+Q8_GROUP = 64
+
+
+def q8_enabled():
+    """Whether this process stores the global visits' KV in packed 8-bit rows."""
+    from mtplx.kv_quant import paged_kv_quant_mode_from_env
+
+    return paged_kv_quant_mode_from_env() == "q8"
+
+
+def settle_kv_quant_for_pack(dtype):
+    """Turn ``--kv-quant q8`` off for a pack whose activations are not bf16: packed rows hold bf16
+    scales and rebuild bf16 values (``pack_rows``, ``attend_q8``), so an FP16 pack keeps its 16-bit
+    banks. Returns the mode this process runs with (``q8`` or ``off``)."""
+    if not q8_enabled():
+        return "off"
+    if dtype == mx.bfloat16:
+        return "q8"
+    from mtplx.runtime_options import apply_paged_kv_quantization_env
+
+    print(f"[mtplx] inkling: --kv-quant q8 needs a bf16 pack, this one is {dtype}; KV quantization is off",
+          flush=True)
+    apply_paged_kv_quantization_env("off")
+    return "off"
+
+
+def packed_width(head_dim):
+    """Bytes of one packed row of ``head_dim`` dimensions."""
+    return int(head_dim) + 4 * (int(head_dim) // Q8_GROUP)
+
+
+def pack_rows(x):
+    """``(..., head_dim)`` bf16 rows as ``(..., packed_width(head_dim))`` uint8 packed rows."""
+    if x.dtype != mx.bfloat16:
+        raise ValueError(f"packed rows hold bf16 KV, got {x.dtype}")
+    w, s, b = mx.quantize(x, group_size=Q8_GROUP, bits=8)
+    sb = mx.stack([s, b], axis=-1).reshape(*s.shape[:-1], 2 * s.shape[-1])
+    return mx.concatenate([w.view(mx.uint8), sb.view(mx.uint8)], axis=-1)
+
+
+def unpack_rows(p, dtype=mx.bfloat16):
+    """Packed rows back to ``(..., head_dim)`` rows, exactly ``mx.dequantize``'s values."""
+    dim = p.shape[-1] * Q8_GROUP // (Q8_GROUP + 4)
+    groups = dim // Q8_GROUP
+    w = mx.contiguous(p[..., :dim]).view(mx.uint32)
+    sb = mx.contiguous(p[..., dim:]).view(mx.bfloat16).reshape(*p.shape[:-1], groups, 2)
+    out = mx.dequantize(w, sb[..., 0], sb[..., 1], group_size=Q8_GROUP, bits=8)
+    return out if out.dtype == dtype else out.astype(dtype)
+
+
+def is_global_bank(kv):
+    """A global visit's cache: the stock bf16 ``KVCache`` or the 8-bit ``Q8BankCache``."""
+    return type(kv) is KVCache or type(kv) is Q8BankCache
+
 
 @contextlib.contextmanager
 def prompt_rows(rows):
@@ -42,7 +99,7 @@ def size_global_banks(caches, rows):
     target = _PROMPT_ROWS.get()
     grown = 0
     for kv in caches:
-        if type(kv) is not KVCache:
+        if not is_global_bank(kv):
             continue
         need = int(kv.offset) + int(rows)
         held = 0 if kv.keys is None else int(kv.keys.shape[2])
@@ -70,7 +127,7 @@ def settle_bank_steps(caches):
     from .fast.state import BANK_STEP
 
     for kv in caches:
-        if type(kv) is KVCache and kv.step != BANK_STEP and kv.keys is not None:
+        if is_global_bank(kv) and kv.step != BANK_STEP and kv.keys is not None:
             kv.step = BANK_STEP
 
 
@@ -110,3 +167,33 @@ class WindowCache(RotatingKVCache):
                 (self.keep, self.max_size, self.offset, min(self._idx, self.max_size)),
             )
         )
+
+
+class Q8BankCache(KVCache):
+    """A global visit's KV in packed 8-bit rows (``pack_rows``): the same bank of whole steps,
+    offset and trim as ``KVCache``, ``uint8 (1, heads, capacity, packed_width)`` arrays where the
+    stock cache holds bf16 ``(1, heads, capacity, head_dim)``. The reference attention reads every
+    row unpacked (``update_and_fetch``); the fast path reads the packed bank in place."""
+
+    def update_and_fetch(self, keys, values):
+        prev, rows = self.offset, keys.shape[2]
+        width = packed_width(keys.shape[3])
+        if self.keys is None or prev + rows > self.keys.shape[2]:
+            n_steps = (self.step + rows - 1) // self.step
+            shape = (keys.shape[0], keys.shape[1], n_steps * self.step, width)
+            new_k, new_v = mx.zeros(shape, mx.uint8), mx.zeros(shape, mx.uint8)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys, self.values = self.keys[..., :prev, :], self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+        self.offset += rows
+        self.keys[..., prev : self.offset, :] = pack_rows(keys)
+        self.values[..., prev : self.offset, :] = pack_rows(values)
+        return (unpack_rows(self.keys[..., : self.offset, :], keys.dtype),
+                unpack_rows(self.values[..., : self.offset, :], values.dtype))
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        raise NotImplementedError("Q8BankCache is already quantized")

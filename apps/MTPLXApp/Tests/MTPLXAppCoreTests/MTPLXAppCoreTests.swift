@@ -3688,6 +3688,24 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"], "q8")
     }
 
+    func testCommandBuilderKeepsPagedKVQuantizationForInkling2() throws {
+        // Inkling 2 Mini's kv_quant_policy declares q8: Settings offers it, so the
+        // launch must export it (the 2.7.0 Qwen 3.8 gap, for a new family).
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed",
+                profile: "sustained",
+                pagedKVQuantization: "q8"
+            ),
+            target: .openCode
+        )
+
+        XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"], "q8")
+    }
+
     func testOfficialModelCatalogIncludesOptimizedQuality() throws {
         let quality = try XCTUnwrap(
             MTPLXModelOption.option(matching: "mtplx-qwen36-27b-optimized-quality")

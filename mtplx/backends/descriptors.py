@@ -1075,7 +1075,9 @@ INKLING_DESCRIPTOR = BackendDescriptor(
                                    default_mode="auto", effort_levels=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
                                    default_effort="high"),
     draft_semantics=DraftSemantics("depth", "Draft depth", 3, 1, 7, "depth"),
-    kv_quant_policy=KVQuantPolicy(supported=False), default_tool_prompt_mode="native",
+    kv_quant_policy=KVQuantPolicy(
+        supported=True, modes=("off", "q8"), proof_level="served_fast_path_measured_m5_pro",
+    ), default_tool_prompt_mode="native",
     required_tool_prompt_mode="native", required_chat_template_profile="tokenizer",
     context_window_policy=ContextWindowPolicy(maximum=1_048_576, default=32_768, source="inkling2_config"),
     status="runtime_runnable_qa_pending", validation_status="runtime_runnable_qa_pending",
@@ -1383,6 +1385,8 @@ def kv_quant_policy_for_model(
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
     if family == "qwen4_exp":
         return QWEN4_EXP_KV_QUANT_POLICY
+    if family == "inkling2":
+        return INKLING_DESCRIPTOR.kv_quant_policy
     return KVQuantPolicy(supported=False)
 
 

@@ -780,6 +780,8 @@ def _commit_target(st, deltas, kept, rows: int):
             undo += [old_k, old_v]
         else:
             keys, values, _count = st.global_view(visit)
+            if keys.dtype == mx.uint8:
+                raise RuntimeError("the committing round writes bf16 rows; 8-bit banks commit on the host")
             keys = mx.slice_update(keys, delta.keys, start, axes=(2,))
             values = mx.slice_update(values, delta.values, start, axes=(2,))
         tails = [st.tail(visit, slot) for slot in range(4)]

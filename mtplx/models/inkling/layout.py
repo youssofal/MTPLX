@@ -67,6 +67,14 @@ def cache_footprint(config: dict, *, draft: bool = False) -> CacheFootprint:
     sliding = sum(layer in local for layer in visits)
     kv_width = config["num_key_value_heads"] * config["head_dim"]
     row_bytes = 2 * kv_width * 2  # Key and value each store BF16.
+    global_row_bytes = row_bytes
+    if not draft:
+        from .cache import packed_width, q8_enabled
+
+        if q8_enabled():
+            # ``--kv-quant q8``: the global visits' banks hold packed rows (``cache.pack_rows``);
+            # window rings and the drafter stay bf16.
+            global_row_bytes = 2 * config["num_key_value_heads"] * packed_width(config["head_dim"])
     if draft:
         tail = (
             2 * config["hidden_size"]
@@ -75,7 +83,7 @@ def cache_footprint(config: dict, *, draft: bool = False) -> CacheFootprint:
         tail_channels = 2 * kv_width + 2 * config["hidden_size"]
         tail = len(visits) * (config["sconv_kernel_size"] - 1) * tail_channels * 4
     return CacheFootprint(
-        (len(visits) - sliding) * row_bytes,
+        (len(visits) - sliding) * global_row_bytes,
         sliding * row_bytes,
         config["sliding_window_size"],
         tail,

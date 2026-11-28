@@ -564,6 +564,8 @@ def fused_attention(layer, a, x, state, visit, panel):
             hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                               newest, panel.pos, layer.rel_basis, window=layer.sliding)
             count("fused.bc_attention")
+            if not layer.sliding and isinstance(keys, mx.array) and keys.dtype == mx.uint8:
+                count("fused.bc_attention.q8")  # an 8-bit global bank read in place (attend_q8)
         except GroupRefused:
             # Issue #706: a launch of this panel's attention is above this GPU's limit for its pipeline.
             _GROUP_REFUSED.add(group_key)
